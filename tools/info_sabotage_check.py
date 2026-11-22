@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-tools/info_sabotage_check.py — 36-Mutant Single-Fault Sabotage Gate (Gate 6)
+tools/info_sabotage_check.py — 42-Mutant Single-Fault Sabotage Gate (Gate 6)
 ===============================================================================
-Verifies 100.0% mutation-kill efficacy (36/36 killed, 0 compile errors) across
-12 categories (3 mutants each) in `src/info_ring0.c`:
+Verifies 100.0% mutation-kill efficacy (42/42 killed, 0 compile errors) across
+14 categories (3 mutants each) in `src/info_ring0.c`:
    1. arith_coder          (3)
    2. stretch_squash       (3)
    3. context_models       (3)
@@ -16,6 +16,8 @@ Verifies 100.0% mutation-kill efficacy (36/36 killed, 0 compile errors) across
   10. delsarte_krawtchouk  (3)
   11. balke_pearl_bounds   (3)
   12. causal_mdl_surprise  (3)
+  13. alpha_mdl_canon      (3)
+  14. lean_expr_canon      (3)
 """
 
 from __future__ import annotations
@@ -363,6 +365,39 @@ def build_info_mutants() -> list[InfoMutant]:
             "        info_ws_reset(ws);\n"
             "        pred_init(&st, flags);\n"
             "        const uint8_t *cur = streams[idx];",
+        ),
+        # --- 14. lean_expr_canon (3) ---
+        InfoMutant(
+            "M40_expr_disable_op_preserve",
+            "lean_expr_canon",
+            "    if (lang == INFO_LANG_LEAN_EXPR) {\n"
+            "        for (size_t i = 0U; i < sizeof(k_kw_expr) / sizeof(k_kw_expr[0]); i++) {\n"
+            "            if (alpha_tok_eq(tok, len, k_kw_expr[i])) {\n"
+            "                return true;\n"
+            "            }\n"
+            "        }",
+            "    if (lang == INFO_LANG_LEAN_EXPR) {\n"
+            "        for (size_t i = 0U; i < sizeof(k_kw_expr) / sizeof(k_kw_expr[0]); i++) {\n"
+            "            if (false && alpha_tok_eq(tok, len, k_kw_expr[i])) {\n"
+            "                return true;\n"
+            "            }\n"
+            "        }",
+        ),
+        InfoMutant(
+            "M41_expr_disable_dot_atom",
+            "lean_expr_canon",
+            "    return lang == INFO_LANG_LEAN_EXPR && (ch == (uint8_t)'.' || ch == (uint8_t)'\\'');",
+            "    return lang == INFO_LANG_LEAN_EXPR && ch == (uint8_t)'\\'';",
+        ),
+        InfoMutant(
+            "M42_expr_preserve_all_consts",
+            "lean_expr_canon",
+            "        return alpha_is_indexed_op(tok, len, \"BV\") || alpha_is_indexed_op(tok, len, \"REF\") ||\n"
+            "               alpha_is_indexed_op(tok, len, \"LV\");\n"
+            "    }",
+            "        (void)alpha_is_indexed_op(tok, len, \"BV\");\n"
+            "        return true;\n"
+            "    }",
         ),
     ]
 

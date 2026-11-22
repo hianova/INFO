@@ -1339,7 +1339,10 @@ static bool alpha_is_ident_cont(uint8_t ch, uint32_t lang) {
     if (alpha_is_ident_start(ch) || (ch >= (uint8_t)'0' && ch <= (uint8_t)'9')) {
         return true;
     }
-    return lang == INFO_LANG_LEAN && ch == (uint8_t)'\'';
+    if (lang == INFO_LANG_LEAN && ch == (uint8_t)'\'') {
+        return true;
+    }
+    return lang == INFO_LANG_LEAN_EXPR && (ch == (uint8_t)'.' || ch == (uint8_t)'\'');
 }
 
 static bool alpha_is_digit(uint8_t ch) {
@@ -1422,6 +1425,26 @@ static bool alpha_is_preserved_num(const uint8_t *tok, size_t len) {
     return false;
 }
 
+static bool alpha_is_indexed_op(const uint8_t *tok, size_t len, const char *pfx) {
+    size_t i = 0U;
+    while (pfx[i] != '\0') {
+        if (i >= len || tok[i] != (uint8_t)pfx[i]) {
+            return false;
+        }
+        i++;
+    }
+    if (i >= len) {
+        return false;
+    }
+    while (i < len) {
+        if (!alpha_is_digit(tok[i])) {
+            return false;
+        }
+        i++;
+    }
+    return true;
+}
+
 static bool alpha_is_preserved_ident(const uint8_t *tok, size_t len, uint32_t lang) {
     static const char *const k_meta[] = {"STR", "NUM", "VX"};
     static const char *const k_flow_pfx[] = {"flow_", "FLOW_", "searu_", "SEARU_", "Flow"};
@@ -1451,7 +1474,19 @@ static bool alpha_is_preserved_ident(const uint8_t *tok, size_t len, uint32_t la
         "bytearray", "list",   "dict",    "tuple",  "set",    "self",   "cls",     "range",
         "len",       "min",    "max",     "sum",    "all",    "any",    "zip",     "enumerate",
         "sorted",    "Path",   "Fraction"};
+    static const char *const k_kw_expr[] = {"AP",  "LM",  "FA",   "LT",   "ST",  "LV",  "PR",
+                                            "BV",  "REF", "PROP", "TYPE", "EQ",  "AND", "OR",
+                                            "NOT", "NAT", "INT",  "BVEC", "THM", "DEF"};
 
+    if (lang == INFO_LANG_LEAN_EXPR) {
+        for (size_t i = 0U; i < sizeof(k_kw_expr) / sizeof(k_kw_expr[0]); i++) {
+            if (alpha_tok_eq(tok, len, k_kw_expr[i])) {
+                return true;
+            }
+        }
+        return alpha_is_indexed_op(tok, len, "BV") || alpha_is_indexed_op(tok, len, "REF") ||
+               alpha_is_indexed_op(tok, len, "LV");
+    }
     for (size_t i = 0U; i < sizeof(k_meta) / sizeof(k_meta[0]); i++) {
         if (alpha_tok_eq(tok, len, k_meta[i])) {
             return true;

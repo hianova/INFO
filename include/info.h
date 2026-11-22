@@ -24,6 +24,7 @@ extern "C" {
 #define INFO_LANG_C            UINT32_C(1)
 #define INFO_LANG_LEAN         UINT32_C(2)
 #define INFO_LANG_PY           UINT32_C(3)
+#define INFO_LANG_LEAN_EXPR    UINT32_C(4)
 #define INFO_ALPHA_HT_SIZE     UINT32_C(512)
 #define INFO_ALPHA_MAX_IDS     UINT32_C(256)
 #define INFO_FNV1A_OFFSET      UINT64_C(0xCBF29CE484222325)

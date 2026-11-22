@@ -360,6 +360,8 @@ def verify_alpha_mdl_oracle() -> None:
     lean_b = "-- different comment\ntheorem bar_b (z : Nat) : z + 1 = 1 + z := by omega\n"
     py_a = "# c1\ndef ele_norm(ele_x: int) -> int:\n    return (ele_x + 42) & 0xFF\n"
     py_b = "# c2\ndef chem_norm(chem_z: int) -> int:\n    return (chem_z + 99) & 0xFF\n"
+    expr_a = "THM C_Alpha.thm : AP FA PROP C_Alpha.add BV0\nAP LM BV0 AP C_Alpha.add C_Alpha.zero\n"
+    expr_b = "THM C_Beta.lem : AP FA PROP C_Beta.mul BV0\nAP LM BV0 AP C_Beta.mul C_Gamma.one\n"
 
     with tempfile.TemporaryDirectory(prefix="inf_oracle_alpha_") as td:
         tdir = Path(td)
@@ -374,7 +376,7 @@ def verify_alpha_mdl_oracle() -> None:
         assert oa.read_bytes() == ob.read_bytes(), "α-renamed C clones failed canonical equality"
         assert b"flow_ir_eval_u64" in oa.read_bytes(), "FLOW anchor dropped during α-canon"
 
-        for ext, s1, s2 in [("lean", lean_a, lean_b), ("py", py_a, py_b)]:
+        for ext, s1, s2 in [("lean", lean_a, lean_b), ("py", py_a, py_b), ("expr", expr_a, expr_b)]:
             f1, f2 = tdir / f"s1.{ext}", tdir / f"s2.{ext}"
             c1, c2 = tdir / f"c1.{ext}", tdir / f"c2.{ext}"
             f1.write_text(s1, encoding="utf-8")
@@ -382,6 +384,7 @@ def verify_alpha_mdl_oracle() -> None:
             assert run_cmd([str(INFO_BIN), "alpha-canon", str(f1), str(c1), "--lang", ext]).returncode == 0
             assert run_cmd([str(INFO_BIN), "alpha-canon", str(f2), str(c2), "--lang", ext]).returncode == 0
             assert c1.read_bytes() == c2.read_bytes(), f"α-renamed {ext} failed canonical equality"
+        assert b"AP LM BV0" in (tdir / "c1.expr").read_bytes(), "Expr opcodes not preserved"
 
         j_ncd = tdir / "ncd.json"
         assert (

@@ -438,15 +438,58 @@ static uint32_t test_t17_alpha_mdl(void) {
     return fails;
 }
 
+static uint32_t test_t18_lean_expr_alpha(void) {
+    uint32_t fails = UINT32_C(0);
+    static const char k_expr_a[] = "THM C_Alpha.thm : AP FA PROP C_Alpha.add BV0\n"
+                                   "AP LM BV0 AP C_Alpha.add C_Alpha.zero\n";
+    static const char k_expr_b[] = "THM C_Beta.lem : AP FA PROP C_Beta.mul BV0\n"
+                                   "AP LM BV0 AP C_Beta.mul C_Gamma.one\n";
+    static const char k_expr_unrel[] = "DEF C_Delta.fn : LT LV0 ST bv AP BV2 BV3\n"
+                                       "AP AP BV1 AP C_Delta.g BV0\n";
+
+    size_t half = INFO_CLI_MAX_BYTES >> 2U;
+    uint8_t *e_a = g_buf_a;
+    uint8_t *e_b = g_buf_b;
+    uint8_t *e_c = g_buf_c;
+    uint8_t *e_u = g_buf_c + half;
+
+    size_t l_a = info_alpha_canonicalize(&g_alpha_ws, (const uint8_t *)k_expr_a, strlen(k_expr_a),
+                                         INFO_LANG_LEAN_EXPR, e_a, half);
+    size_t l_b = info_alpha_canonicalize(&g_alpha_ws, (const uint8_t *)k_expr_b, strlen(k_expr_b),
+                                         INFO_LANG_LEAN_EXPR, e_b, half);
+    size_t l_c = info_alpha_canonicalize(&g_alpha_ws, e_a, l_a, INFO_LANG_LEAN_EXPR, e_c, half);
+    size_t l_u = info_alpha_canonicalize(&g_alpha_ws, (const uint8_t *)k_expr_unrel,
+                                         strlen(k_expr_unrel), INFO_LANG_LEAN_EXPR, e_u, half);
+
+    if (l_a == 0U || l_a != l_b || !info_mem_eq(e_a, e_b, l_a) || l_c != l_a ||
+        !info_mem_eq(e_a, e_c, l_a)) {
+        fails++;
+    }
+    if (!info_buf_contains(e_a, l_a, "AP") || !info_buf_contains(e_a, l_a, "BV0") ||
+        info_buf_contains(e_a, l_a, "C_Alpha")) {
+        fails++;
+    }
+
+    const uint8_t *clones[3] = {e_a, e_b, e_c};
+    size_t clone_lens[3] = {l_a, l_b, l_c};
+    info_joint_mdl_t jm_good, jm_bad;
+    info_eval_joint_mdl(&g_ws, clones, clone_lens, 3U, e_a, l_a, INFO_CODEC_FLAG_ALG, &jm_good);
+    info_eval_joint_mdl(&g_ws, clones, clone_lens, 2U, e_u, l_u, INFO_CODEC_FLAG_ALG, &jm_bad);
+    if (jm_good.extract_gain_bits_q12 <= 0 || jm_bad.extract_gain_bits_q12 >= 0) {
+        fails++;
+    }
+    return fails;
+}
+
 static int info_cmd_selftest(void) {
     uint32_t f_prim = test_t1_t4_primitives();
     uint32_t f_codec = test_t5_t7_codec_roundtrip();
     uint32_t f_sep = test_t8_t10_separation();
     uint32_t f_thy = test_t11_t16_theory_and_certs();
-    uint32_t f_mdl = test_t17_alpha_mdl();
+    uint32_t f_mdl = test_t17_alpha_mdl() + test_t18_lean_expr_alpha();
     uint32_t total = f_prim + f_codec + f_sep + f_thy + f_mdl;
     printf("[selftest] T1..T4(prim)=%s T5..T7(codec)=%s T8..T10(alg_sep)=%s "
-           "T11..T17(ctw/delsarte/causal/fir/alpha_mdl)=%s | fails=%u\n",
+           "T11..T18(ctw/delsarte/causal/fir/alpha_mdl/lean_expr)=%s | fails=%u\n",
            f_prim == 0U ? "PASS" : "FAIL", f_codec == 0U ? "PASS" : "FAIL",
            f_sep == 0U ? "PASS" : "FAIL", (f_thy + f_mdl) == 0U ? "PASS" : "FAIL", (unsigned)total);
     return (total == 0U) ? 0 : 1;
@@ -885,6 +928,9 @@ static uint32_t info_parse_lang(const char *s) {
     if (info_cstr_eq(s, "py")) {
         return INFO_LANG_PY;
     }
+    if (info_cstr_eq(s, "expr")) {
+        return INFO_LANG_LEAN_EXPR;
+    }
     return INFO_LANG_RAW;
 }
 
@@ -1090,9 +1136,9 @@ int main(int argc, char **argv) {
             "Usage:\n  info selftest\n  info compress <in> <out.inf> [--no-alg]\n"
             "  info decompress <in.inf> <out>\n  info eval-bpb <in> [--no-alg] [--out-json <p>]\n"
             "  info ncd <file_a> <file_b> [--out-json <p>]\n"
-            "  info alpha-canon <in> <out> [--lang raw|c|lean|py]\n"
-            "  info alpha-ncd <file_a> <file_b> [--lang raw|c|lean|py] [--out-json <p>]\n"
-            "  info eval-mdl-group [--alpha] [--lang raw|c|lean|py] [--shared <m>] "
+            "  info alpha-canon <in> <out> [--lang raw|c|lean|py|expr]\n"
+            "  info alpha-ncd <file_a> <file_b> [--lang raw|c|lean|py|expr] [--out-json <p>]\n"
+            "  info eval-mdl-group [--alpha] [--lang raw|c|lean|py|expr] [--shared <m>] "
             "[--out-json <p>] <f1> ...\n"
             "  info causal-mdl <x_file> <y_file> [--out-json <p>]\n"
             "  info classify-<ctw|separation|delsarte|causal> [--out-json <p>]\n"

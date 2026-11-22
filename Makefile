@@ -65,11 +65,16 @@ $(BUILD)/lean/Info/Causal.olean: Info/Causal.lean
 	@mkdir -p $(dir $@)
 	$(LEAN) -DwarningAsError=true --root=. -o $@ $<
 
+$(BUILD)/lean/Info/ProofMDL.olean: Info/ProofMDL.lean $(BUILD)/lean/Info/Coding.olean
+	@mkdir -p $(dir $@)
+	LEAN_PATH=$(BUILD)/lean $(LEAN) -DwarningAsError=true --root=. -o $@ $<
+
 $(BUILD)/lean/Info/Theory.olean: Info/Theory.lean \
 		$(BUILD)/lean/Info/Coding.olean \
 		$(BUILD)/lean/Info/Induction.olean \
 		$(BUILD)/lean/Info/Bounds.olean \
-		$(BUILD)/lean/Info/Causal.olean
+		$(BUILD)/lean/Info/Causal.olean \
+		$(BUILD)/lean/Info/ProofMDL.olean
 	@mkdir -p $(dir $@)
 	LEAN_PATH=$(BUILD)/lean $(LEAN) -DwarningAsError=true --root=. -o $@ $<
 
@@ -95,18 +100,18 @@ $(BUILD)/info: $(BUILD)/info_ring0.o src/info_cli.c src/info_cert.h include/info
 	$(CC) $(C17_HOST_FLAGS) $(INC_HOST) $(LDFLAGS_STRIP) $(BUILD)/info_ring0.o src/info_cli.c -o $@
 
 gate0-lean-theory: $(BUILD)/lean/Info/Theory.olean
-	@echo "[Gate 0] Checking 4 pure-theory pillars via leanchecker and axiom audit..."
-	@if grep -qiE '\bsorry\b' Info/Coding.lean Info/Induction.lean Info/Bounds.lean Info/Causal.lean Info/Theory.lean; then \
+	@echo "[Gate 0] Checking 5 pure-theory pillars via leanchecker and axiom audit..."
+	@if grep -qiE '\bsorry\b' Info/Coding.lean Info/Induction.lean Info/Bounds.lean Info/Causal.lean Info/ProofMDL.lean Info/Theory.lean; then \
 		echo "ERROR: sorry found in Info theory modules"; exit 1; \
 	fi
-	@for m in Info.Coding Info.Induction Info.Bounds Info.Causal Info.Theory; do \
+	@for m in Info.Coding Info.Induction Info.Bounds Info.Causal Info.ProofMDL Info.Theory; do \
 		LEAN_PATH=$(BUILD)/lean $(LEANCHECKER) $$m || exit 1; \
 	done
-	@python3 -c 'import pathlib, re; mods=[("Info.Coding","Info/Coding.lean"),("Info.Induction","Info/Induction.lean"),("Info.Bounds","Info/Bounds.lean"),("Info.Causal","Info/Causal.lean")]; thms=[f"#print axioms {m}.{n}" for m,p in mods for n in re.findall(r"^theorem\s+(\S+)", pathlib.Path(p).read_text(encoding="utf-8"), re.M)]; assert len(thms)==79, f"Expected 79 theorems, got {len(thms)}"; pathlib.Path("$(BUILD)/info_axioms.in").write_text("import Info.Theory\n" + "\n".join(thms) + "\n", encoding="utf-8")'
+	@python3 -c 'import pathlib, re; mods=[("Info.Coding","Info/Coding.lean"),("Info.Induction","Info/Induction.lean"),("Info.Bounds","Info/Bounds.lean"),("Info.Causal","Info/Causal.lean"),("Info.ProofMDL","Info/ProofMDL.lean")]; thms=[f"#print axioms {m}.{n}" for m,p in mods for n in re.findall(r"^theorem\s+(\S+)", pathlib.Path(p).read_text(encoding="utf-8"), re.M)]; assert len(thms)==89, f"Expected 89 theorems, got {len(thms)}"; pathlib.Path("$(BUILD)/info_axioms.in").write_text("import Info.Theory\n" + "\n".join(thms) + "\n", encoding="utf-8")'
 	@LEAN_PATH=$(BUILD)/lean $(LEAN) --stdin < $(BUILD)/info_axioms.in > $(BUILD)/info_axioms.txt
 	@if grep -q 'sorryAx' $(BUILD)/info_axioms.txt; then echo "ERROR: sorryAx detected"; exit 1; fi
 	@if grep -q 'Lean\.ofReduceBool' $(BUILD)/info_axioms.txt; then echo "ERROR: Lean.ofReduceBool detected"; exit 1; fi
-	@echo "[Gate 0] PASS (Info.Theory 79 theorems, 0 sorryAx, 0 ofReduceBool)"
+	@echo "[Gate 0] PASS (Info.Theory 89 theorems, 0 sorryAx, 0 ofReduceBool)"
 
 gate1-lean-schema: $(BUILD)/info_schema_abi.h
 	@echo "[Gate 1] Auditing Info.lean pure schema config and generated ABI header..."
@@ -137,7 +142,7 @@ endif
 	@echo "[Gate 2] PASS (0 undef symbols, Pure-GPR clean, C++20 clean, clang-tidy 0 warnings)"
 
 gate3-selftest: $(BUILD)/info
-	@echo "[Gate 3] Running built-in 17-suite Ring-0 + cert selftest..."
+	@echo "[Gate 3] Running built-in 18-suite Ring-0 + cert selftest..."
 	./$(BUILD)/info selftest
 	@echo "[Gate 3] PASS"
 
@@ -161,7 +166,7 @@ gate5-oracle: gate0-lean-theory gate1-lean-schema gate4-cli-audit
 	@echo "[Gate 5] PASS"
 
 gate6-sabotage: gate1-lean-schema
-	@echo "[Gate 6] Running 39-mutant single-fault sabotage gate..."
+	@echo "[Gate 6] Running 42-mutant single-fault sabotage gate..."
 	python3 tools/info_sabotage_check.py
 	@echo "[Gate 6] PASS"
 
@@ -170,13 +175,14 @@ gate7-format:
 	$(CLANG_FORMAT) --dry-run --Werror $(C_SOURCES)
 	@echo "[Gate 7] PASS"
 
-experiments: $(BUILD)/info $(BUILD)/info_decomp
-	@echo "[Experiments] Running 5 compression, intelligence, CTW, Delsarte LP & Ecosystem MDL benchmarks..."
+experiments: $(BUILD)/info $(BUILD)/info_decomp $(BUILD)/lean/Info/Theory.olean
+	@echo "[Experiments] Running 6 compression, intelligence, CTW, Delsarte LP, Ecosystem & Lean Proof MDL suites..."
 	python3 experiments/hutter_benchmark.py
 	python3 experiments/intelligence_downstream.py
 	python3 experiments/ctw_switching_atlas.py
 	python3 experiments/delsarte_coding_atlas.py
 	python3 experiments/ecosystem_mdl_audit.py
+	python3 experiments/lean_proof_distill.py
 	@echo "[Experiments] PASS"
 
 verify-all: gate0-lean-theory gate1-lean-schema gate2-ring0-audit gate3-selftest \
