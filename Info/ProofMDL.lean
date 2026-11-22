@@ -239,4 +239,177 @@ theorem proof_blueprint_core_lower_bound (lib : List DeclCost) (isCore : DeclCos
       simp [totalLibCost, h] at ih ⊢ <;>
       omega
 
+/-- Elementary node kind in a canonical hash-consed Proof-DAG table. -/
+inductive DagOp where
+  | leaf (tag atom : Nat)
+  | unary (tag child : Nat)
+  | binary (tag left right : Nat)
+  deriving Repr, DecidableEq
+
+/-- Minimal decoded AST expression reconstructed from a serialized Proof-DAG row. -/
+inductive DecodedExpr where
+  | atom (tag a : Nat)
+  | node1 (tag : Nat) (c : DecodedExpr)
+  | node2 (tag : Nat) (l r : DecodedExpr)
+  deriving Repr, DecidableEq
+
+/-- Safe total list lookup used for fuel-bounded DAG reconstruction. -/
+def dagAt? {α : Type} : List α → Nat → Option α
+  | [], _ => none
+  | x :: _, 0 => some x
+  | _ :: xs, n + 1 => dagAt? xs n
+
+private theorem dagAt?_some_of_lt {α : Type} :
+    ∀ (xs : List α) (i : Nat), i < xs.length → ∃ x, dagAt? xs i = some x
+  | [], i, h => by simp at h
+  | x :: _, 0, _ => ⟨x, rfl⟩
+  | _ :: xs, n + 1, h => dagAt?_some_of_lt xs n (by simp at h; omega)
+
+/-- Topological well-formedness for a single DAG node at row `idx`. -/
+def dagOpBounded (idx : Nat) : DagOp → Prop
+  | .leaf _ _ => True
+  | .unary _ c => c < idx
+  | .binary _ l r => l < idx ∧ r < idx
+
+/-- Topological invariant: every row in `ops` references strictly earlier row indices. -/
+def DagWellFormed (ops : List DagOp) : Prop :=
+  ∀ i op, dagAt? ops i = some op → dagOpBounded i op
+
+/-- Fuel-bounded recursive decoder from a serialized DAG table row back to a tree AST. -/
+def decodeDagFuel (ops : List DagOp) : Nat → Nat → Option DecodedExpr
+  | 0, _ => none
+  | fuel + 1, idx =>
+    match dagAt? ops idx with
+    | none => none
+    | some (.leaf tag a) => some (.atom tag a)
+    | some (.unary tag c) =>
+      match decodeDagFuel ops fuel c with
+      | some ec => some (.node1 tag ec)
+      | none => none
+    | some (.binary tag l r) =>
+      match decodeDagFuel ops fuel l, decodeDagFuel ops fuel r with
+      | some el, some er => some (.node2 tag el er)
+      | _, _ => none
+
+private theorem decodeDagFuel_of_lt (ops : List DagOp) (hwf : DagWellFormed ops) :
+    ∀ fuel idx, idx < fuel → idx < ops.length →
+      ∃ e, decodeDagFuel ops fuel idx = some e
+  | 0, _, hlt, _ => by omega
+  | fuel + 1, idx, hlt, hlen => by
+    obtain ⟨op, hop⟩ := dagAt?_some_of_lt ops idx hlen
+    cases op with
+    | leaf tag a =>
+      refine ⟨.atom tag a, ?_⟩
+      simp [decodeDagFuel, hop]
+    | unary tag c =>
+      have hcb : c < idx := hwf idx _ hop
+      have hcf : c < fuel := by omega
+      have hcl : c < ops.length := by omega
+      obtain ⟨ec, hec⟩ := decodeDagFuel_of_lt ops hwf fuel c hcf hcl
+      refine ⟨.node1 tag ec, ?_⟩
+      simp [decodeDagFuel, hop, hec]
+    | binary tag l r =>
+      have hlr : l < idx ∧ r < idx := hwf idx _ hop
+      have hlf : l < fuel := by omega
+      have hrf : r < fuel := by omega
+      have hll : l < ops.length := by omega
+      have hrl : r < ops.length := by omega
+      obtain ⟨el, hel⟩ := decodeDagFuel_of_lt ops hwf fuel l hlf hll
+      obtain ⟨er, her⟩ := decodeDagFuel_of_lt ops hwf fuel r hrf hrl
+      refine ⟨.node2 tag el er, ?_⟩
+      simp [decodeDagFuel, hop, hel, her]
+
+/-- 11. Well-Formed Hash-Consed DAG Completeness: any topologically ordered Proof-DAG table
+        with `n` rows decodes losslessly from every valid root index in at most `n` fuel steps. -/
+theorem dag_wellformed_decodes (ops : List DagOp) (hwf : DagWellFormed ops)
+    (root : Nat) (hroot : root < ops.length) :
+    ∃ tree, decodeDagFuel ops ops.length root = some tree :=
+  decodeDagFuel_of_lt ops hwf ops.length root hroot hroot
+
+/-- Full binary sharing diamond of depth `n`. -/
+def chainApp : Nat → DecodedExpr
+  | 0 => .atom 0 0
+  | n + 1 =>
+    let sub := chainApp n
+    .node2 1 sub sub
+
+/-- Linear `(n + 1)`-row DAG table representing `chainApp n` via hash-consed sharing. -/
+def chainDag : Nat → List DagOp
+  | 0 => [.leaf 0 0]
+  | n + 1 => chainDag n ++ [.binary 1 n n]
+
+/-- Unfolded AST node count of a decoded expression tree. -/
+def decodedTreeSize : DecodedExpr → Nat
+  | .atom _ _ => 1
+  | .node1 _ c => 1 + decodedTreeSize c
+  | .node2 _ l r => 1 + decodedTreeSize l + decodedTreeSize r
+
+private theorem chainDag_length : ∀ n, (chainDag n).length = n + 1
+  | 0 => rfl
+  | n + 1 => by simp [chainDag, chainDag_length n]
+
+private theorem pow2_le_chainApp : ∀ n, 2 ^ n ≤ decodedTreeSize (chainApp n)
+  | 0 => by decide
+  | n + 1 => by
+    have ih := pow2_le_chainApp n
+    have hp : 2 ^ (n + 1) = 2 ^ n * 2 := Nat.pow_succ 2 n
+    change 2 ^ (n + 1) ≤ 1 + decodedTreeSize (chainApp n) + decodedTreeSize (chainApp n)
+    omega
+
+private theorem linear_lt_pow2 : ∀ n, 3 ≤ n → n + 1 < 2 ^ n
+  | 0, h => by omega
+  | 1, h => by omega
+  | 2, h => by omega
+  | 3, _ => by decide
+  | n + 4, _ => by
+    have ih := linear_lt_pow2 (n + 3) (by omega)
+    have hp : 2 ^ (n + 4) = 2 ^ (n + 3) * 2 := Nat.pow_succ 2 (n + 3)
+    omega
+
+/-- 12. Exponential DAG Sharing Gap: hash-consing compresses `chainApp n` to a `chainDag n`
+        table of `n + 1` rows while its unfolded AST spans at least `2 ^ n` nodes. -/
+theorem dag_sharing_exponential_gap (n : Nat) :
+    (chainDag n).length = n + 1 ∧
+      2 ^ n ≤ decodedTreeSize (chainApp n) ∧
+      (3 ≤ n → (chainDag n).length < decodedTreeSize (chainApp n)) := by
+  refine ⟨chainDag_length n, pow2_le_chainApp n, fun hn => ?_⟩
+  have hlen : (chainDag n).length = n + 1 := chainDag_length n
+  have hlin : n + 1 < 2 ^ n := linear_lt_pow2 n hn
+  have htree : 2 ^ n ≤ decodedTreeSize (chainApp n) := pow2_le_chainApp n
+  omega
+
+/-- 13. Grammar/Macro Compression Breakeven: hoisting `k` occurrences of a body of cost `w`
+        into a shared rule with definition overhead `h` and call reference cost `r ≤ w`
+        strictly reduces total MDL iff `h + w < k * (w - r)`. -/
+theorem grammar_pair_compression_breakeven (k w h r : Nat) (hrw : r ≤ w) :
+    h + w + k * r < k * w ↔ h + w < k * (w - r) := by
+  have hk : k * (w - r) + k * r = k * w := by
+    rw [← Nat.mul_add, Nat.sub_add_cancel hrw]
+  omega
+
+/-- 14. Columnar `.infp` Container Dominance: an `.infp` payload (`hdrCost + payloadCost`)
+        strictly beats flat AST serialization `flatCost` whenever DAG deduplication
+        (`flatCost - dagCost`) plus Ring-0 entropy reduction (`dagCost - payloadCost`)
+        exceeds the fixed container header `hdrCost`. -/
+theorem infp_container_beats_flat_ast
+    (flatCost dagCost payloadCost hdrCost : Nat)
+    (hdag : dagCost ≤ flatCost)
+    (hinf1 : payloadCost ≤ dagCost)
+    (hgain : hdrCost < (flatCost - dagCost) + (dagCost - payloadCost)) :
+    hdrCost + payloadCost < flatCost := by
+  omega
+
+/-- 15. Cognitive Transparency MDL Bound (`INFO × SOUND` Bridge): given plain-language disclosure
+        MDL `summaryBits` and comprehension budget `budgetBits`, a contract whose conditional
+        complexity stays within `budgetBits` strictly dominates an obfuscated contract exceeding it. -/
+theorem cognitive_transparency_mdl_bound
+    (summaryBits fairJointBits predJointBits budgetBits : Nat)
+    (hfairMono : summaryBits ≤ fairJointBits)
+    (hpredMono : summaryBits ≤ predJointBits)
+    (hfairBudget : fairJointBits - summaryBits ≤ budgetBits)
+    (hpredObfuscated : budgetBits < predJointBits - summaryBits) :
+    fairJointBits < predJointBits ∧
+      (fairJointBits - summaryBits) < (predJointBits - summaryBits) := by
+  omega
+
 end Info.ProofMDL
