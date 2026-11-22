@@ -12,17 +12,8 @@ namespace Info
 open Flow.Schema
 
 def hdrLayout : CellLayout64 :=
-  CellLayout64.packed64 "hdr" "InfoHeader64" "hdr"
-    [ ("magic", .u32, 1)
-    , ("version", .u32, 1)
-    , ("total_cells", .u32, 1)
-    , ("codec_flags", .u32, 1)
-    , ("orig_size", .u64, 1)
-    , ("compressed_size", .u64, 1)
-    , ("payload_hash", .u64, 1)
-    , ("merkle_root", .u64, 1)
-    , ("pad", .u64, 2)
-    ]
+  CellLayout64.stdHeader64 "hdr" "InfoHeader64" "codec_flags"
+    ["orig_size", "compressed_size", "payload_hash", "merkle_root"]
 
 def codecStatsLayout : CellLayout64 :=
   CellLayout64.packed64 "codec_stats" "InfoCodecStats64" "codec_stats"

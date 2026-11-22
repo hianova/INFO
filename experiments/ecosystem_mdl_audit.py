@@ -180,6 +180,71 @@ def run_part1_synthetic_ground_truth() -> None:
         print(f"    Joint ΔMDL   : 3-clone gain={gp:+.1f} B (> 0) | unrelated gain={gn:+.1f} B (< 0)")
         assert gp > 0.0 and gn < 0.0
 
+    # Verify noise/boilerplate classifier prevents false PR promotions
+    tools_dir = str(ROOT / "tools")
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    from info_ecosystem_audit import classify_block_kind, classify_file_role  # type: ignore
+
+    assert (
+        classify_file_role(
+            Path("include/ele.h"),
+            "ELE/include/ele.h",
+            "typedef struct { uint64_t magic; } EleAbi;\n#define ELE_MAGIC 1\n",
+            "c",
+        )
+        == "abi_header"
+    )
+    assert (
+        classify_file_role(
+            Path("Phy.lean"),
+            "PHY/Phy.lean",
+            "def hdrLayout : CellLayout64 := CellLayout64.stdHeader64\n",
+            "lean",
+        )
+        == "abi_header"
+    )
+    assert (
+        classify_file_role(
+            Path("oracles/verify_noether_oracle.py"),
+            "PHY/oracles/verify_noether_oracle.py",
+            "def verify(): return True\n",
+            "py",
+        )
+        == "domain_oracle"
+    )
+    assert (
+        classify_file_role(
+            Path("experiments/exp1.py"),
+            "INFO/experiments/exp1.py",
+            "def run(): return 0\n",
+            "py",
+        )
+        == "experiment_script"
+    )
+    assert (
+        classify_file_role(
+            Path("src/ele_cert.c"),
+            "ELE/src/ele_cert.c",
+            c_ele,
+            "c",
+        )
+        == "logic"
+    )
+    table_src = "static const uint32_t lut[] = {\n" + "  0x01, 0x02, 0x03, 0x04,\n" * 10 + "};\n"
+    assert classify_block_kind("PAINTER_LUT", table_src, "c", "logic") == "data_table"
+    assert classify_block_kind("ele_mix_hash", c_ele, "c", "logic") == "logic"
+    assert (
+        classify_block_kind(
+            "hdrLayout",
+            "def hdrLayout : CellLayout64 := CellLayout64.stdHeader64",
+            "lean",
+            "abi_header",
+        )
+        == "schema_layout"
+    )
+    print("    Classifier   : abi_header / domain_oracle / experiment_script / data_table / logic PASS")
+
 
 def run_part2_live_ecosystem() -> None:
     print("  --- Part 2: Live FLOW Ecosystem Cross-Repo MDL Audit ---")
@@ -219,6 +284,10 @@ def run_part2_live_ecosystem() -> None:
         data = json.loads(out_json.read_text(encoding="utf-8"))
         assert data["files_indexed"] >= 10
         assert len(data["file_pairs"]) >= 1 or len(present) < 2
+        assert "logic_clusters" in data and "filtered_clusters" in data
+        assert "logic_func_clones" in data and "filtered_func_clones" in data
+        assert data["clusters"] == data["logic_clusters"]
+        assert "files" in data and all("role" in f for f in data["files"])
 
 
 def main() -> int:

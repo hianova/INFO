@@ -47,6 +47,90 @@ def run_info(args: List[str]) -> subprocess.CompletedProcess:
     )
 
 
+def classify_file_role(path: Path, label: str, text: str, lang: str) -> str:
+    """Classify a source file as genuine 'logic' or non-PR boilerplate/oracle/manifest."""
+    rel = label.split("/", 1)[1] if "/" in label else label
+    rel_low = rel.lower()
+    name_low = path.name.lower()
+
+    if any(part.lower() in {"fixtures", "datasets", "manifests"} for part in path.parts) or any(
+        tok in name_low for tok in ("manifest", "fixture", "dataset")
+    ):
+        return "data_manifest"
+    if rel_low.startswith("benchmarks/"):
+        num_lits = len(re.findall(r"(?:0x[0-9a-fA-F]+|-?\d+\.\d+)", text))
+        if "gen" not in name_low and num_lits >= 40:
+            return "data_manifest"
+        return "experiment_script"
+
+    if rel_low.startswith("oracles/") or "_oracle" in name_low or "oracle_" in name_low:
+        return "domain_oracle"
+
+    if rel_low.startswith(("experiments/", "scripts/")):
+        return "experiment_script"
+
+    if (
+        lang == "lean"
+        and "/" not in rel
+        and ("emit-schema" in text or "emitCHeader" in text or "CellLayout64" in text)
+        and len(re.findall(r"^\s*(?:private\s+|protected\s+)?theorem\b", text, re.M)) == 0
+    ):
+        return "abi_header"
+
+    if (
+        lang == "c"
+        and path.suffix == ".h"
+        and (rel_low.startswith("include/") or "_abi" in name_low)
+        and "_cert" not in name_low
+        and not name_low.startswith("flow_")
+    ):
+        loops = len(re.findall(r"\b(?:for|while)\s*\(", text))
+        if loops <= 2 and (
+            "typedef struct" in text
+            or text.count("#define ") >= 6
+            or rel_low.startswith("include/")
+        ):
+            return "abi_header"
+
+    return "logic"
+
+
+def classify_block_kind(name: str, body: str, lang: str, file_role: str) -> str:
+    """Classify an extracted function/declaration block as 'logic' or schema/data/oracle."""
+    if file_role == "domain_oracle" or "oracle" in name.lower():
+        return "domain_oracle"
+
+    if (
+        file_role == "abi_header"
+        or any(
+            tok in body
+            for tok in ("CellLayout64", "stdHeader64", "emitCHeader", "SchemaField", "typedef struct")
+        )
+        or (
+            lang == "lean"
+            and name.endswith("Layout")
+            and len(re.findall(r"\b(?:for|while|induction|omega)\b", body)) == 0
+        )
+    ):
+        return "schema_layout"
+
+    if file_role == "data_manifest":
+        return "data_table"
+
+    n_lits = len(re.findall(r"(?:0x[0-9A-Fa-f]+|\b-?\d+(?:\.\d+)?(?:e[+-]?\d+)?\b)", body))
+    ctrl_hits = len(
+        re.findall(r"\b(?:for|while|switch|match|induction|by|calc|omega|bv_decide)\b", body)
+    )
+    lines_nz = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    table_lines = sum(
+        1 for ln in lines_nz if ln.startswith(("{", "[", "(")) or ln.endswith((",", "},", "],", "),"))
+    )
+    if n_lits >= 24 and ctrl_hits <= 1 and table_lines >= max(6, len(lines_nz) // 3):
+        return "data_table"
+
+    return "logic"
+
+
 def discover_files(roots: Sequence[Path]) -> List[Dict[str, object]]:
     files: List[Dict[str, object]] = []
     seen_real: Set[Path] = set()
@@ -73,13 +157,17 @@ def discover_files(roots: Sequence[Path]) -> List[Dict[str, object]]:
                 continue
             seen_real.add(rp)
             rel = p.relative_to(r_res).as_posix()
+            label = f"{repo}/{rel}"
+            text = rp.read_text(encoding="utf-8", errors="ignore")
+            role = classify_file_role(rp, label, text, lang)
             files.append(
                 {
                     "idx": len(files),
                     "repo": repo,
                     "lang": lang,
+                    "role": role,
                     "path": rp,
-                    "label": f"{repo}/{rel}",
+                    "label": label,
                     "raw_bytes": sz,
                 }
             )
@@ -184,7 +272,8 @@ def eval_alpha_ncd_pair(
 def analyze_file_pairs(
     files: List[Dict[str, object]], tmp_dir: Path, max_eval: int
 ) -> List[Dict[str, object]]:
-    cands: List[Tuple[float, int, int]] = []
+    logic_cands: List[Tuple[float, int, int]] = []
+    filtered_cands: List[Tuple[float, int, int]] = []
     n = len(files)
     for i in range(n):
         fi = files[i]
@@ -194,9 +283,14 @@ def analyze_file_pairs(
                 continue
             jac = jaccard(fi["shingles"], fj["shingles"])  # type: ignore[arg-type]
             if jac >= 0.08:
-                cands.append((jac, i, j))
-    cands.sort(key=lambda x: (-x[0], x[1], x[2]))
-    cands = cands[:max_eval]
+                if fi["role"] == "logic" and fj["role"] == "logic":
+                    logic_cands.append((jac, i, j))
+                else:
+                    filtered_cands.append((jac, i, j))
+    logic_cands.sort(key=lambda x: (-x[0], x[1], x[2]))
+    filtered_cands.sort(key=lambda x: (-x[0], x[1], x[2]))
+    # Reserve separate evaluation budgets so boilerplate headers/scripts never starve logic pairs.
+    cands = logic_cands[:max_eval] + filtered_cands[:max_eval]
 
     pdir = tmp_dir / "file_ncd"
     pdir.mkdir(parents=True, exist_ok=True)
@@ -217,6 +311,9 @@ def analyze_file_pairs(
             "b": fj["label"],
             "repo_a": fi["repo"],
             "repo_b": fj["repo"],
+            "role_a": fi["role"],
+            "role_b": fj["role"],
+            "is_logic": (fi["role"] == "logic" and fj["role"] == "logic"),
             "lang": fi["lang"],
             "jaccard": jac,
             **metrics,
@@ -313,15 +410,21 @@ def extract_blocks_from_file(entry: Dict[str, object]) -> List[Dict[str, object]
                 i += 1
 
     out: List[Dict[str, object]] = []
+    kind_counts: Dict[str, int] = defaultdict(int)
+    file_role = str(entry["role"])
     for b in blocks:
         sh = rough_skeleton_shingles(str(b["text"]), k=4)
         if len(sh) < 6:
             continue
+        b_kind = classify_block_kind(str(b["name"]), str(b["text"]), lang, file_role)
+        kind_counts[b_kind] += 1
         out.append(
             {
                 "file_idx": entry["idx"],
                 "repo": entry["repo"],
                 "lang": lang,
+                "file_role": file_role,
+                "kind": b_kind,
                 "label": entry["label"],
                 "path": entry["path"],
                 "name": b["name"],
@@ -331,6 +434,7 @@ def extract_blocks_from_file(entry: Dict[str, object]) -> List[Dict[str, object]
                 "shingles": sh,
             }
         )
+    entry["block_kinds"] = dict(kind_counts)
     return out
 
 
@@ -341,8 +445,8 @@ def analyze_function_clones(
     for f in files:
         all_blocks.extend(extract_blocks_from_file(f))
 
-    cands: List[Tuple[float, int, int]] = []
-    nb = len(all_blocks)
+    logic_cands: List[Tuple[float, int, int]] = []
+    filtered_cands: List[Tuple[float, int, int]] = []
     by_lang: Dict[str, List[int]] = defaultdict(list)
     for idx, b in enumerate(all_blocks):
         by_lang[str(b["lang"])].append(idx)
@@ -359,9 +463,19 @@ def analyze_function_clones(
                     continue
                 jac = jaccard(bi["shingles"], bj["shingles"])  # type: ignore[arg-type]
                 if jac >= 0.22:
-                    cands.append((jac, i, j))
-    cands.sort(key=lambda x: (-x[0], x[1], x[2]))
-    cands = cands[:max_eval]
+                    both_logic = (
+                        bi["file_role"] == "logic"
+                        and bj["file_role"] == "logic"
+                        and bi["kind"] == "logic"
+                        and bj["kind"] == "logic"
+                    )
+                    if both_logic:
+                        logic_cands.append((jac, i, j))
+                    else:
+                        filtered_cands.append((jac, i, j))
+    logic_cands.sort(key=lambda x: (-x[0], x[1], x[2]))
+    filtered_cands.sort(key=lambda x: (-x[0], x[1], x[2]))
+    cands = logic_cands[:max_eval] + filtered_cands[:max_eval]
 
     fdir = tmp_dir / "func_ncd"
     fdir.mkdir(parents=True, exist_ok=True)
@@ -378,11 +492,22 @@ def analyze_function_clones(
         metrics = eval_alpha_ncd_pair(
             block_paths[i], block_paths[j], str(bi["lang"]), fdir / f"fn_{k}.json"
         )
+        is_logic = (
+            bi["file_role"] == "logic"
+            and bj["file_role"] == "logic"
+            and bi["kind"] == "logic"
+            and bj["kind"] == "logic"
+        )
         return {
             "file_idx_a": bi["file_idx"],
             "file_idx_b": bj["file_idx"],
             "span_a": f"{bi['label']}:{bi['start']}-{bi['end']} ({bi['name']})",
             "span_b": f"{bj['label']}:{bj['start']}-{bj['end']} ({bj['name']})",
+            "role_a": bi["file_role"],
+            "role_b": bj["file_role"],
+            "kind_a": bi["kind"],
+            "kind_b": bj["kind"],
+            "is_logic": is_logic,
             "text_a": bi["text"],
             "text_b": bj["text"],
             "lang": bi["lang"],
@@ -396,11 +521,13 @@ def analyze_function_clones(
     return res
 
 
-def cluster_and_eval_joint_mdl(
+def _eval_cluster_subgraph(
     files: List[Dict[str, object]],
-    pair_rows: List[Dict[str, object]],
-    func_rows: List[Dict[str, object]],
-    tmp_dir: Path,
+    edge_pairs: List[Dict[str, object]],
+    edge_funcs: List[Dict[str, object]],
+    all_pairs: List[Dict[str, object]],
+    mdir: Path,
+    tag_reason: bool,
 ) -> List[Dict[str, object]]:
     n = len(files)
     parent = list(range(n))
@@ -417,14 +544,14 @@ def cluster_and_eval_joint_mdl(
             parent[rb] = ra
 
     active_edges: Set[Tuple[int, int]] = set()
-    for row in pair_rows:
+    for row in edge_pairs:
         i, j = int(row["i"]), int(row["j"])
         ancd = float(row["alpha_ncd"])
         red = float(row["redund_alpha_pct"])
         if ancd < 0.78 or red >= 26.0:
             union(i, j)
             active_edges.add((i, j))
-    for fr in func_rows:
+    for fr in edge_funcs:
         if float(fr["alpha_ncd"]) < 0.25 or float(fr["redund_alpha_pct"]) >= 85.0:
             fi_a, fi_b = int(fr["file_idx_a"]), int(fr["file_idx_b"])
             union(fi_a, fi_b)
@@ -436,7 +563,6 @@ def cluster_and_eval_joint_mdl(
         comps[find(j)].add(j)
 
     cluster_results: List[Dict[str, object]] = []
-    mdir = tmp_dir / "mdl_clusters"
     mdir.mkdir(parents=True, exist_ok=True)
 
     for cid, raw_nodes in enumerate(comps.values()):
@@ -449,7 +575,6 @@ def cluster_and_eval_joint_mdl(
         node_set = set(nodes)
         lang = str(files[nodes[0]]["lang"])
 
-        # Shared canonical skeleton: canonical lines occurring in >= 2 distinct repos in cluster
         line_repos: Dict[str, Set[str]] = defaultdict(set)
         ordered_lines: List[str] = []
         for idx in nodes:
@@ -463,17 +588,14 @@ def cluster_and_eval_joint_mdl(
                 line_repos[s].add(rname)
 
         shared_lines = [ln for ln in ordered_lines if len(line_repos[ln]) >= 2]
-        # If whole-file offsets shifted global De Bruijn IDs, distill shared skeleton
-        # from the verified overlapping function blocks of this cluster.
         matched_funcs = [
             fr
-            for fr in func_rows
+            for fr in edge_funcs
             if int(fr["file_idx_a"]) in node_set
             and int(fr["file_idx_b"]) in node_set
             and (float(fr["alpha_ncd"]) < 0.25 or float(fr["redund_alpha_pct"]) >= 85.0)
         ]
         if matched_funcs:
-            # Evaluate extracted clone-group MDL cleanly on the overlapping blocks
             blk_texts: List[str] = []
             seen_spans: Set[str] = set()
             for fr in matched_funcs[:8]:
@@ -503,7 +625,6 @@ def cluster_and_eval_joint_mdl(
         else:
             fn_gain = 0.0
 
-        # Evaluate whole-file cluster MDL if common file lines exist, else use clone-block ΔMDL
         if len(shared_lines) >= 3:
             shared_p = mdir / f"cluster_{cid}_shared.canon"
             shared_p.write_text("\n".join(shared_lines) + "\n", encoding="utf-8")
@@ -532,77 +653,140 @@ def cluster_and_eval_joint_mdl(
             continue
 
         root_scores: Dict[int, float] = defaultdict(float)
-        for row in pair_rows:
+        for row in all_pairs:
             ri, rj = int(row["i"]), int(row["j"])
             if ri in node_set and rj in node_set:
                 root_scores[ri] += float(row["alpha_lba_bytes"])
                 root_scores[rj] += float(row["alpha_lab_bytes"])
         root_idx = min(nodes, key=lambda idx: root_scores.get(idx, 1e18))
 
-        cluster_results.append(
-            {
-                "cluster_id": cid,
-                "lang": lang,
-                "repos": sorted(repos),
-                "has_flow": "FLOW" in repos,
-                "members": [str(files[idx]["label"]) for idx in nodes],
-                "shared_lines": len(shared_lines),
-                "sum_indep_bytes": round(indep_b, 1),
-                "seq_savings_bytes": round(seq_b, 1),
-                "shared_model_bytes": round(shared_b, 1),
-                "delta_mdl_bytes": round(gain_b, 1),
-                "hierarchy_root": str(files[root_idx]["label"]),
-            }
-        )
+        reason = "logic"
+        if tag_reason:
+            rcounts: Dict[str, int] = defaultdict(int)
+            for idx in nodes:
+                r = str(files[idx]["role"])
+                if r != "logic":
+                    rcounts[r] += 2
+            for fr in matched_funcs:
+                for k_field in ("kind_a", "kind_b", "role_a", "role_b"):
+                    val = str(fr.get(k_field, "logic"))
+                    if val != "logic":
+                        rcounts[val] += 1
+            reason = max(rcounts.items(), key=lambda kv: kv[1])[0] if rcounts else "boilerplate"
+
+        entry: Dict[str, object] = {
+            "cluster_id": cid,
+            "lang": lang,
+            "repos": sorted(repos),
+            "has_flow": "FLOW" in repos,
+            "members": [str(files[idx]["label"]) for idx in nodes],
+            "shared_lines": len(shared_lines),
+            "sum_indep_bytes": round(indep_b, 1),
+            "seq_savings_bytes": round(seq_b, 1),
+            "shared_model_bytes": round(shared_b, 1),
+            "delta_mdl_bytes": round(gain_b, 1),
+            "hierarchy_root": str(files[root_idx]["label"]),
+        }
+        if tag_reason:
+            entry["filter_reason"] = reason
+        cluster_results.append(entry)
 
     cluster_results.sort(key=lambda c: -float(c["delta_mdl_bytes"]))
     return cluster_results
+
+
+def cluster_and_eval_joint_mdl(
+    files: List[Dict[str, object]],
+    pair_rows: List[Dict[str, object]],
+    func_rows: List[Dict[str, object]],
+    tmp_dir: Path,
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    logic_pairs = [r for r in pair_rows if bool(r.get("is_logic", True))]
+    filt_pairs = [r for r in pair_rows if not bool(r.get("is_logic", True))]
+    logic_funcs = [f for f in func_rows if bool(f.get("is_logic", True))]
+    filt_funcs = [f for f in func_rows if not bool(f.get("is_logic", True))]
+
+    mdir = tmp_dir / "mdl_clusters"
+    logic_clusters = _eval_cluster_subgraph(
+        files, logic_pairs, logic_funcs, pair_rows, mdir / "logic", tag_reason=False
+    )
+    filtered_clusters = _eval_cluster_subgraph(
+        files, filt_pairs, filt_funcs, pair_rows, mdir / "filtered", tag_reason=True
+    )
+    return logic_clusters, filtered_clusters
 
 
 def render_markdown_report(
     files: List[Dict[str, object]],
     pair_rows: List[Dict[str, object]],
     func_rows: List[Dict[str, object]],
-    clusters: List[Dict[str, object]],
+    logic_clusters: List[Dict[str, object]],
+    filtered_clusters: List[Dict[str, object]],
     top_pairs: int,
     top_funcs: int,
 ) -> str:
     repos = sorted({str(f["repo"]) for f in files})
+    role_counts: Dict[str, int] = defaultdict(int)
+    for f in files:
+        role_counts[str(f["role"])] += 1
+    role_summary = ", ".join(f"`{k}`={v}" for k, v in sorted(role_counts.items()))
+
+    logic_pairs = [r for r in pair_rows if bool(r.get("is_logic", True))]
+    filt_pairs = [r for r in pair_rows if not bool(r.get("is_logic", True))]
+    logic_funcs = [f for f in func_rows if bool(f.get("is_logic", True))]
+    filt_funcs = [f for f in func_rows if not bool(f.get("is_logic", True))]
+
     lines: List[str] = [
         "# FLOW Ecosystem Structural MDL Audit Report (`INFO v1.0.0`)",
         "",
         f"- **Scanned Repositories ({len(repos)})**: {', '.join(repos)}",
-        f"- **Indexed Source Files**: `{len(files)}` (`.c`, `.h`, `.lean`, `.py`)",
-        f"- **Evaluated Cross-Repo File Pairs**: `{len(pair_rows)}` | **Evaluated Function Clones**: `{len(func_rows)}`",
-        f"- **Actionable Joint-MDL Clusters (`>= 2` repos)**: `{len(clusters)}`",
+        f"- **Indexed Source Files**: `{len(files)}` ({role_summary})",
+        f"- **Logic File Pairs / Func Clones**: `{len(logic_pairs)}` pairs, `{len(logic_funcs)}` func clones | **Filtered**: `{len(filt_pairs)}` pairs, `{len(filt_funcs)}` clones",
+        f"- **Actionable Logic Joint-MDL Clusters (`>= 2` repos)**: `{len(logic_clusters)}` | **Filtered Boilerplate/Oracle/Table Clusters**: `{len(filtered_clusters)}`",
         "",
-        "## 1. Level 3 — Ranked `FLOW` PR Extraction Priorities (`ΔMDL > 0`)",
+        "## 1. Level 3 — Ranked `FLOW` PR Extraction Priorities (Logic Clusters, `ΔMDL > 0`)",
         "",
         "| Rank | Lang | Repos | Hierarchy Root | `L(M)` | `Sum Indep` | `Seq Savings` | `ΔMDL Gain` | Action |",
         "| ---: | --- | --- | --- | ---: | ---: | ---: | ---: | --- |",
     ]
-    for idx, c in enumerate(clusters, 1):
+    for idx, c in enumerate(logic_clusters, 1):
         action = "Promote to FLOW" if not c["has_flow"] else "Align w/ FLOW"
         lines.append(
             f"| {idx} | `{c['lang']}` | {', '.join(c['repos'])} | `{c['hierarchy_root']}` | "
             f"`{c['shared_model_bytes']:.0f} B` | `{c['sum_indep_bytes']:.0f} B` | "
             f"`{c['seq_savings_bytes']:+.0f} B` | **`{c['delta_mdl_bytes']:+.0f} B`** | {action} |"
         )
+    if not logic_clusters:
+        lines.append("| - | - | - | *(No genuine multi-repo logic clusters above threshold)* | - | - | - | - | - |")
     lines.append("")
-    for idx, c in enumerate(clusters, 1):
-        lines.append(f"### Cluster {idx}: `{' / '.join(c['repos'])}` (`{c['lang']}`, ΔMDL = `{c['delta_mdl_bytes']:+.0f} B`)")
+    for idx, c in enumerate(logic_clusters, 1):
+        lines.append(f"### Logic Cluster {idx}: `{' / '.join(c['repos'])}` (`{c['lang']}`, ΔMDL = `{c['delta_mdl_bytes']:+.0f} B`)")
         lines.append(f"- **Recommended Base / Hierarchy Root**: `{c['hierarchy_root']}` (`{c['shared_lines']}` shared canonical lines, `L_alpha(M) = {c['shared_model_bytes']:.0f} B`)")
         for m in c["members"]:
             lines.append(f"  - `{m}`")
         lines.append("")
 
+    if filtered_clusters:
+        lines.extend([
+            "## 1b. Filtered Non-PR Clusters (ABI Headers / Experiment Scripts / Data Tables / Domain Oracles)",
+            "",
+            "| Rank | Reason | Lang | Repos | Hierarchy Root | `ΔMDL Gain` | Members |",
+            "| ---: | --- | --- | --- | --- | ---: | ---: |",
+        ])
+        for idx, c in enumerate(filtered_clusters, 1):
+            lines.append(
+                f"| {idx} | `{c['filter_reason']}` | `{c['lang']}` | {', '.join(c['repos'])} | "
+                f"`{c['hierarchy_root']}` | `{c['delta_mdl_bytes']:+.0f} B` | {len(c['members'])} |"
+            )
+        lines.append("")
+
     lines.extend([
-        f"## 2. Level 1 vs Level 2 — Top {min(top_pairs, len(pair_rows))} Cross-Repo File Pairs (`raw_NCD` vs `alpha_NCD`)",
+        f"## 2. Level 1 vs Level 2 — Top {min(top_pairs, len(logic_pairs))} Cross-Repo Logic File Pairs (`raw_NCD` vs `alpha_NCD`)",
         "",
         "| File A | File B | `raw_NCD` | `alpha_NCD` | `I_alpha(A;B)` | `Redund%` | Hierarchy |",
         "| --- | --- | ---: | ---: | ---: | ---: | --- |",
     ])
-    for r in pair_rows[:top_pairs]:
+    for r in logic_pairs[:top_pairs]:
         lines.append(
             f"| `{r['a']}` | `{r['b']}` | `{r['raw_ncd']:.3f}` | **`{r['alpha_ncd']:.3f}`** | "
             f"`{r['mi_alpha_bytes']:.0f} B` | `{r['redund_alpha_pct']:.1f}%` | `{r['subsume']}` |"
@@ -610,16 +794,28 @@ def render_markdown_report(
 
     lines.extend([
         "",
-        f"## 3. Level 2 — Top {min(top_funcs, len(func_rows))} Isomorphic Cross-Repo Functions / Blocks",
+        f"## 3. Level 2 — Top {min(top_funcs, len(logic_funcs))} Isomorphic Cross-Repo Logic Functions / Blocks",
         "",
         "| Block Span A | Block Span B | `raw_NCD` | `alpha_NCD` | `I_alpha` | `Redund%` |",
         "| --- | --- | ---: | ---: | ---: | ---: |",
     ])
-    for f in func_rows[:top_funcs]:
+    for f in logic_funcs[:top_funcs]:
         lines.append(
             f"| `{f['span_a']}` | `{f['span_b']}` | `{f['raw_ncd']:.3f}` | **`{f['alpha_ncd']:.3f}`** | "
             f"`{f['mi_alpha_bytes']:.0f} B` | `{f['redund_alpha_pct']:.1f}%` |"
         )
+    if filt_funcs:
+        lines.extend([
+            "",
+            f"### Filtered Structural Clones (Top {min(5, len(filt_funcs))}, Non-PR)",
+            "",
+            "| Kind | Block Span A | Block Span B | `alpha_NCD` | `Redund%` |",
+            "| --- | --- | --- | ---: | ---: |",
+        ])
+        for f in filt_funcs[:5]:
+            lines.append(
+                f"| `{f['kind_a']}`/`{f['kind_b']}` | `{f['span_a']}` | `{f['span_b']}` | `{f['alpha_ncd']:.3f}` | `{f['redund_alpha_pct']:.1f}%` |"
+            )
     lines.append("")
     return "\n".join(lines)
 
@@ -638,35 +834,56 @@ def main() -> int:
     assert INFO_BIN.is_file(), f"Missing {INFO_BIN}"
     files = discover_files(args.roots)
     repos = sorted({str(f["repo"]) for f in files})
-    print(f"[INFO-Audit] Indexed {len(files)} source files across {len(repos)} repos: {', '.join(repos)}")
+    role_counts: Dict[str, int] = defaultdict(int)
+    for f in files:
+        role_counts[str(f["role"])] += 1
+    print(
+        f"[INFO-Audit] Indexed {len(files)} source files across {len(repos)} repos: "
+        f"{', '.join(repos)} (logic={role_counts.get('logic', 0)}, filtered={len(files) - role_counts.get('logic', 0)})"
+    )
 
     with tempfile.TemporaryDirectory(prefix="info_eco_audit_") as td:
         tdir = Path(td)
         canonicalize_all(files, tdir)
         pair_rows = analyze_file_pairs(files, tdir, max_eval=args.max_ncd_eval)
         func_rows = analyze_function_clones(files, tdir, max_eval=args.max_func_eval)
-        clusters = cluster_and_eval_joint_mdl(files, pair_rows, func_rows, tdir)
+        logic_clusters, filtered_clusters = cluster_and_eval_joint_mdl(
+            files, pair_rows, func_rows, tdir
+        )
 
-    print("\n  --- Top Level-3 Joint MDL FLOW PR Candidates ---")
-    if clusters:
-        for idx, c in enumerate(clusters[:10], 1):
+    logic_pairs = [r for r in pair_rows if bool(r.get("is_logic", True))]
+    filt_pairs = [r for r in pair_rows if not bool(r.get("is_logic", True))]
+    logic_funcs = [f for f in func_rows if bool(f.get("is_logic", True))]
+    filt_funcs = [f for f in func_rows if not bool(f.get("is_logic", True))]
+
+    print("\n  --- Top Level-3 Joint MDL FLOW PR Candidates (Logic Only) ---")
+    if logic_clusters:
+        for idx, c in enumerate(logic_clusters[:10], 1):
             print(
                 f"    #{idx} [{c['lang']:<4}] deltaMDL={c['delta_mdl_bytes']:>+7.0f}B "
                 f"(seq={c['seq_savings_bytes']:>+7.0f}B, shared={c['shared_model_bytes']:.0f}B) "
                 f"| repos={','.join(c['repos'])} | root={c['hierarchy_root']}"
             )
     else:
-        print("    (No multi-repo clusters above threshold in scanned roots)")
+        print("    (No genuine multi-repo logic clusters above threshold in scanned roots)")
 
-    print(f"\n  --- Top Cross-Repo File Pairs (showing {min(args.top_pairs, len(pair_rows))}/{len(pair_rows)}) ---")
-    for r in pair_rows[: args.top_pairs]:
+    if filtered_clusters:
+        print(f"\n  --- Filtered Non-PR Clusters ({len(filtered_clusters)}: abi_header / experiment / data_table / oracle) ---")
+        for idx, c in enumerate(filtered_clusters[:8], 1):
+            print(
+                f"    [FILT:{c['filter_reason']:<17}] [{c['lang']:<4}] deltaMDL={c['delta_mdl_bytes']:>+7.0f}B "
+                f"| repos={','.join(c['repos'])} | root={c['hierarchy_root']}"
+            )
+
+    print(f"\n  --- Top Logic Cross-Repo File Pairs (showing {min(args.top_pairs, len(logic_pairs))}/{len(logic_pairs)}) ---")
+    for r in logic_pairs[: args.top_pairs]:
         print(
             f"    {r['a']:<36} <-> {r['b']:<36} | rawNCD={r['raw_ncd']:.3f} alphaNCD={r['alpha_ncd']:.3f} "
             f"I={r['mi_alpha_bytes']:>5.0f}B ({r['redund_alpha_pct']:>4.1f}%) {r['subsume']}"
         )
 
-    print(f"\n  --- Top Cross-Repo Function Clones (showing {min(args.top_funcs, len(func_rows))}/{len(func_rows)}) ---")
-    for f in func_rows[: args.top_funcs]:
+    print(f"\n  --- Top Logic Cross-Repo Function Clones (showing {min(args.top_funcs, len(logic_funcs))}/{len(logic_funcs)}) ---")
+    for f in logic_funcs[: args.top_funcs]:
         print(
             f"    {f['span_a']:<44} <-> {f['span_b']:<44} | raw={f['raw_ncd']:.3f} alpha={f['alpha_ncd']:.3f} ({f['redund_alpha_pct']:.1f}%)"
         )
@@ -675,7 +892,13 @@ def main() -> int:
         args.out_md.parent.mkdir(parents=True, exist_ok=True)
         args.out_md.write_text(
             render_markdown_report(
-                files, pair_rows, func_rows, clusters, args.top_pairs, args.top_funcs
+                files,
+                pair_rows,
+                func_rows,
+                logic_clusters,
+                filtered_clusters,
+                args.top_pairs,
+                args.top_funcs,
             ),
             encoding="utf-8",
         )
@@ -686,9 +909,27 @@ def main() -> int:
                 {
                     "repos": repos,
                     "files_indexed": len(files),
+                    "file_roles": dict(role_counts),
+                    "files": [
+                        {
+                            "label": f["label"],
+                            "repo": f["repo"],
+                            "lang": f["lang"],
+                            "role": f["role"],
+                            "raw_bytes": f["raw_bytes"],
+                            "block_kinds": f.get("block_kinds", {}),
+                        }
+                        for f in files
+                    ],
                     "file_pairs": pair_rows,
+                    "logic_file_pairs": logic_pairs,
+                    "filtered_file_pairs": filt_pairs,
                     "func_clones": func_rows,
-                    "clusters": clusters,
+                    "logic_func_clones": logic_funcs,
+                    "filtered_func_clones": filt_funcs,
+                    "clusters": logic_clusters,
+                    "logic_clusters": logic_clusters,
+                    "filtered_clusters": filtered_clusters,
                 },
                 indent=2,
             )

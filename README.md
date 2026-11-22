@@ -2,7 +2,7 @@
 
 **Certified Algorithmic Information Theory, Ring-0 Pure-GPR Hutter Context-Mixing & Law-Induction Codec, Causal MDL & Combinatorial Bounds**
 
-`INFO v1.0.0` unifies algorithmic coding foundations, context-vs-induction separation, finite coding/channel bounds, and causal identifiability on top of `../FLOW` (`Flow.Schema` 256-slot `16,384B` ABI) across four formally verified Lean 4 pillars (`79` theorems total, `0 sorryAx`, `0 Lean.ofReduceBool`):
+`INFO v1.0.0` unifies algorithmic coding foundations, context-vs-induction separation, finite coding/channel bounds, and causal identifiability on top of `../FLOW` (`v9.0.0`, `Flow.Schema` 256-slot `16,384B` ABI) across four formally verified Lean 4 pillars (`79` theorems total, `0 sorryAx`, `0 Lean.ofReduceBool`):
 
 1. **Algorithmic Coding, E1/E2/E3 Invariants & Structural α-MDL (`Info.Coding` — `28` theorems)**:
    - Pigeonhole incompressibility no-go, Kraft–McMillan prefix-tree inequality, Solomonoff/Bayes mixture dominance, Krichevsky–Trofimov (KT) exact rational conservation recurrence, 32-bit `E1/E2/E3` binary arithmetic renormalization & `bv_decide` bit-recovery proofs, plus De Bruijn α-canonicalization idempotency/renaming invariance (`deBruijnCanon_idempotent`, `deBruijnCanon_map_inj`) and Joint MDL refactoring breakeven (`mdl_no_free_abstraction`, `mdl_refactor_breakeven`, `mdl_asymmetric_hierarchy`).
@@ -37,7 +37,7 @@ Measured on real C17/Python/Markdown corpora, analytical depth-2 FSMX Markov sou
 - **Causal Direction & Spike Latency**: Interleaved `causal-mdl` recovers **`4/4` (`100.0%`)** non-invertible ICM causal directions (`X -> Y`) vs. permutation-blind symmetric `deflate`; online surprise tracker detects injected regime switch at **`+0 B` latency** (`0.00 b/B` clean peak vs. `19.05 b/B` spike).
 - **CTW & Switching Redundancy (`experiments/ctw_switching_atlas.py`)**: Cross-checks Ring-0 KT conservation and multi-switch dominance across finite horizons `512..4096 B`.
 - **Exact Rational Delsarte LP Atlas (`experiments/delsarte_coding_atlas.py`)**: Solves Delsarte's primal LP using pure-Python `fractions.Fraction` Simplex with Bland's rule across `n = 4..10, d = 3..5`, verifying strong duality and `SEARU <= floor(A_LP)` on every row (`EXACT` match on `[7,3]=16`, `[7,4]=8`).
-- **Structural α-Canonicalization & Ecosystem MDL Auditor (`experiments/ecosystem_mdl_audit.py`, `tools/info_ecosystem_audit.py`)**: Verifies De Bruijn α-invariance across C17/Lean4/Python (`raw_NCD = 0.542 -> alpha_NCD = 0.017`) and audits `3,443` source files across `FLOW`, `ELE`, `CHEM`, `QUA`, `ECON`, `PHY`, `SOUND`, and `INFO` to rank shared structures for `FLOW` PR extraction (`+1,689 B` `ECON/ELE` Cholesky Lean proofs, `+1,578 B` C headers, `+1,043 B` `"FIR1"` cert emitters, `+600 B` sabotage harnesses, `+534 B` `GaugeBundle/Noether` Lean lemmas, `+443 B` `CHEM/PHY` McMurchie–Davidson integrals).
+- **Structural α-Canonicalization & Ecosystem MDL Auditor (`experiments/ecosystem_mdl_audit.py`, `tools/info_ecosystem_audit.py`)**: Verifies De Bruijn α-invariance across C17/Lean4/Python (`raw_NCD = 0.542 -> alpha_NCD = 0.017`) and audits `3,451` source files across `FLOW`, `ELE`, `CHEM`, `QUA`, `ECON`, `PHY`, `SOUND`, and `INFO`. `classify_file_role` & `classify_block_kind` separate actionable `logic` clusters from `abi_header` / `experiment_script` / `domain_oracle` / `data_manifest` / `data_table` / `schema_layout` noise; across Wave 1–2 refactoring on `FLOW v9.0.0`, remaining logic-only `ΔMDL` dropped from `7,427 B` baseline down to `1,733 B` across `7` actionable logic clusters (plus `4` filtered non-PR clusters).
 
 ## Architecture
 
@@ -47,8 +47,8 @@ Measured on real C17/Python/Markdown corpora, analytical depth-2 FSMX Markov sou
 - [`src/info_decomp_main.c`](src/info_decomp_main.c): Zero-heap standalone `"INF1"` decompressor (`build/info_decomp`, `34,072 B`).
 - [`src/info_cert.h`](src/info_cert.h) & [`src/info_cli.c`](src/info_cli.c): Zero-heap, zero-`leanshared` host CLI (`build/info`), `17`-suite `selftest`, and live `.lean` / `"FIR1"` certificate emitter.
 - [`oracles/verify_info_oracle.py`](oracles/verify_info_oracle.py): Gate 5 independent exact-rational oracle (`6/6` `info_decomp` SHA-256 checks + all `4` classifiers + `5/5` live `lean -DwarningAsError=true` & `leanchecker` cert replays + α-MDL invariance checks).
-- [`tools/info_sabotage_check.py`](tools/info_sabotage_check.py): Gate 6 parallel `39`-mutant single-fault C17 verification suite across `13` categories (`39/39 = 100.0%` killed).
-- [`tools/info_ecosystem_audit.py`](tools/info_ecosystem_audit.py): Cross-repository structural MDL auditor (`alpha-canon`, `alpha-ncd`, `eval-mdl-group`).
+- [`tools/info_sabotage_check.py`](tools/info_sabotage_check.py): Gate 6 parallel `39`-mutant single-fault C17 verification suite across `13` categories (`39/39 = 100.0%` killed), delegating to `../FLOW/sdk/tools/flow_sabotage_runner.py`.
+- [`tools/info_ecosystem_audit.py`](tools/info_ecosystem_audit.py): Cross-repository structural MDL auditor (`alpha-canon`, `alpha-ncd`, `eval-mdl-group`) with role/kind noise filtering (`logic_clusters` vs `filtered_clusters`).
 
 ## Build, 8-Gate Verification & CLI
 
