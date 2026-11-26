@@ -334,7 +334,7 @@ def build_info_mutants() -> list[InfoMutant]:
         InfoMutant(
             "M37_alpha_disable_id_norm",
             "alpha_mdl_canon",
-            "    if (id < INFO_ALPHA_MAX_IDS) {\n"
+            "    if (id < UINT16_C(256)) {\n"
             "        static const uint8_t k_hex[16] = {'0', '1', '2', '3', '4', '5', '6', '7',\n"
             "                                          '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};\n"
             "        uint8_t buf[3];\n"
@@ -342,7 +342,17 @@ def build_info_mutants() -> list[InfoMutant]:
             "        buf[1] = k_hex[((uint32_t)id >> 4U) & UINT32_C(0xF)];\n"
             "        buf[2] = k_hex[(uint32_t)id & UINT32_C(0xF)];\n"
             "        alpha_emit_slice(w, buf, 3U);\n"
+            "    } else if (id < INFO_ALPHA_MAX_IDS) {\n"
+            "        static const uint8_t k_hex[16] = {'0', '1', '2', '3', '4', '5', '6', '7',\n"
+            "                                          '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};\n"
+            "        uint8_t buf[4];\n"
+            "        buf[0] = (uint8_t)'V';\n"
+            "        buf[1] = k_hex[((uint32_t)id >> 8U) & UINT32_C(0xF)];\n"
+            "        buf[2] = k_hex[((uint32_t)id >> 4U) & UINT32_C(0xF)];\n"
+            "        buf[3] = k_hex[(uint32_t)id & UINT32_C(0xF)];\n"
+            "        alpha_emit_slice(w, buf, 4U);\n"
             "    } else {\n"
+            "        aws->vx_count++;\n"
             "        alpha_emit_cstr(w, \"VX\");\n"
             "    }",
             "    (void)id;\n"

@@ -25,8 +25,9 @@ extern "C" {
 #define INFO_LANG_LEAN         UINT32_C(2)
 #define INFO_LANG_PY           UINT32_C(3)
 #define INFO_LANG_LEAN_EXPR    UINT32_C(4)
-#define INFO_ALPHA_HT_SIZE     UINT32_C(512)
-#define INFO_ALPHA_MAX_IDS     UINT32_C(256)
+#define INFO_LANG_C_STRICT     UINT32_C(5)
+#define INFO_ALPHA_HT_SIZE     UINT32_C(8192)
+#define INFO_ALPHA_MAX_IDS     UINT32_C(4096)
 #define INFO_FNV1A_OFFSET      UINT64_C(0xCBF29CE484222325)
 #define INFO_FNV1A_PRIME       UINT64_C(0x00000100000001B3)
 
@@ -74,6 +75,7 @@ typedef struct {
     uint64_t keys[INFO_ALPHA_HT_SIZE];
     uint16_t vals[INFO_ALPHA_HT_SIZE];
     uint32_t unique_ids;
+    uint32_t vx_count;
 } info_alpha_ws_t;
 
 typedef struct {

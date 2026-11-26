@@ -1492,12 +1492,14 @@ static bool alpha_is_preserved_ident(const uint8_t *tok, size_t len, uint32_t la
             return true;
         }
     }
-    for (size_t i = 0U; i < sizeof(k_flow_pfx) / sizeof(k_flow_pfx[0]); i++) {
-        if (alpha_has_prefix(tok, len, k_flow_pfx[i])) {
-            return true;
+    if (lang != INFO_LANG_C_STRICT) {
+        for (size_t i = 0U; i < sizeof(k_flow_pfx) / sizeof(k_flow_pfx[0]); i++) {
+            if (alpha_has_prefix(tok, len, k_flow_pfx[i])) {
+                return true;
+            }
         }
     }
-    if (lang == INFO_LANG_C) {
+    if (lang == INFO_LANG_C || lang == INFO_LANG_C_STRICT) {
         for (size_t i = 0U; i < sizeof(k_kw_c) / sizeof(k_kw_c[0]); i++) {
             if (alpha_tok_eq(tok, len, k_kw_c[i])) {
                 return true;
@@ -1547,7 +1549,7 @@ static void alpha_emit_debruijn_id(info_alpha_ws_t *aws, info_alpha_writer_t *w,
             break;
         }
     }
-    if (id < INFO_ALPHA_MAX_IDS) {
+    if (id < UINT16_C(256)) {
         static const uint8_t k_hex[16] = {'0', '1', '2', '3', '4', '5', '6', '7',
                                           '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
         uint8_t buf[3];
@@ -1555,7 +1557,17 @@ static void alpha_emit_debruijn_id(info_alpha_ws_t *aws, info_alpha_writer_t *w,
         buf[1] = k_hex[((uint32_t)id >> 4U) & UINT32_C(0xF)];
         buf[2] = k_hex[(uint32_t)id & UINT32_C(0xF)];
         alpha_emit_slice(w, buf, 3U);
+    } else if (id < INFO_ALPHA_MAX_IDS) {
+        static const uint8_t k_hex[16] = {'0', '1', '2', '3', '4', '5', '6', '7',
+                                          '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
+        uint8_t buf[4];
+        buf[0] = (uint8_t)'V';
+        buf[1] = k_hex[((uint32_t)id >> 8U) & UINT32_C(0xF)];
+        buf[2] = k_hex[((uint32_t)id >> 4U) & UINT32_C(0xF)];
+        buf[3] = k_hex[(uint32_t)id & UINT32_C(0xF)];
+        alpha_emit_slice(w, buf, 4U);
     } else {
+        aws->vx_count++;
         alpha_emit_cstr(w, "VX");
     }
 }
@@ -1633,6 +1645,10 @@ size_t info_alpha_canonicalize(info_alpha_ws_t *aws, const uint8_t *src, size_t 
         return 0U;
     }
     info_zero_bytes(aws, sizeof(*aws));
+    uint32_t orig_lang = lang;
+    if (lang == INFO_LANG_C_STRICT) {
+        lang = INFO_LANG_C;
+    }
     if (lang == INFO_LANG_RAW) {
         size_t n = (src_len < dst_cap) ? src_len : dst_cap;
         for (size_t i = 0U; i < n; i++) {
@@ -1725,7 +1741,7 @@ size_t info_alpha_canonicalize(info_alpha_ws_t *aws, const uint8_t *src, size_t 
                 i++;
             }
             size_t tlen = i - start;
-            if (alpha_is_preserved_ident(src + start, tlen, lang)) {
+            if (alpha_is_preserved_ident(src + start, tlen, orig_lang)) {
                 alpha_emit_slice(&w, src + start, tlen);
             } else {
                 alpha_emit_debruijn_id(aws, &w, src + start, tlen);

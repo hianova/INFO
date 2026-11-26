@@ -12,6 +12,9 @@ static info_alpha_ws_t g_alpha_ws;
 static uint8_t g_buf_a[INFO_CLI_MAX_BYTES + 1024U];
 static uint8_t g_buf_b[INFO_CLI_MAX_BYTES + 1024U];
 static uint8_t g_buf_c[INFO_CLI_MAX_BYTES + 1024U];
+static uint8_t g_buf_bg[INFO_CLI_MAX_BYTES + 1024U];
+static uint8_t g_buf_bg_canon[INFO_CLI_MAX_BYTES + 1024U];
+static uint8_t g_buf_prefix[INFO_CLI_MAX_BYTES + 1024U];
 
 static bool info_cstr_eq(const char *a, const char *b) {
     if (a == NULL || b == NULL) {
@@ -433,6 +436,34 @@ static uint32_t test_t17_alpha_mdl(void) {
     info_eval_joint_mdl(&g_ws, clones, clone_lens, 2U, c_unrel, l_unrel, INFO_CODEC_FLAG_ALG,
                         &jm_bad);
     if (jm_bad.extract_gain_bits_q12 >= 0) {
+        fails++;
+    }
+
+    /* Regression: >256 unique C identifiers emit V100..VFFF (0 VX) cleanly & idempotently,
+     * and INFO_LANG_C_STRICT canonicalizes flow_* library prefixes. */
+    static char many_buf[16384];
+    size_t mpos = 0U;
+    for (uint32_t k = 0U; k < 300U && mpos + 32U < sizeof(many_buf); k++) {
+        int wr = snprintf(many_buf + mpos, sizeof(many_buf) - mpos, "uint32_t uvar_%u = %uU;\n",
+                          (unsigned)k, (unsigned)k);
+        if (wr > 0) {
+            mpos += (size_t)wr;
+        }
+    }
+    size_t l_many = info_alpha_canonicalize(&g_alpha_ws, (const uint8_t *)many_buf, mpos,
+                                            INFO_LANG_C, c_a, half);
+    if (g_alpha_ws.unique_ids != 300U || g_alpha_ws.vx_count != 0U ||
+        !info_buf_contains(c_a, l_many, "V100") || info_buf_contains(c_a, l_many, "VX")) {
+        fails++;
+    }
+    size_t l_many_idem =
+        info_alpha_canonicalize(&g_alpha_ws, c_a, l_many, INFO_LANG_C, c_idem, half);
+    if (l_many_idem != l_many || !info_mem_eq(c_a, c_idem, l_many)) {
+        fails++;
+    }
+    size_t l_strict = info_alpha_canonicalize(&g_alpha_ws, (const uint8_t *)k_src_a,
+                                              strlen(k_src_a), INFO_LANG_C_STRICT, c_b, half);
+    if (l_strict == 0U || info_buf_contains(c_b, l_strict, "flow_ir_eval_u64")) {
         fails++;
     }
     return fails;
@@ -922,6 +953,9 @@ static uint32_t info_parse_lang(const char *s) {
     if (info_cstr_eq(s, "c")) {
         return INFO_LANG_C;
     }
+    if (info_cstr_eq(s, "c-strict")) {
+        return INFO_LANG_C_STRICT;
+    }
     if (info_cstr_eq(s, "lean")) {
         return INFO_LANG_LEAN;
     }
@@ -950,8 +984,8 @@ static int info_cmd_alpha_canon(int argc, char **argv) {
         (void)fprintf(stderr, "ERROR: cannot write %s\n", out_p);
         return 1;
     }
-    printf("[alpha-canon] in=%zuB out=%zuB unique_ids=%u\n", len, clen,
-           (unsigned)g_alpha_ws.unique_ids);
+    printf("[alpha-canon] in=%zuB out=%zuB unique_ids=%u vx=%u\n", len, clen,
+           (unsigned)g_alpha_ws.unique_ids, (unsigned)g_alpha_ws.vx_count);
     return 0;
 }
 
@@ -959,6 +993,7 @@ static int info_cmd_alpha_ncd(int argc, char **argv) {
     const char *p_a = argv[2];
     const char *p_b = argv[3];
     const char *lang_s = info_parse_opt(argc, argv, 4, "--lang");
+    const char *bg_p = info_parse_opt(argc, argv, 4, "--bg");
     const char *out_json = info_parse_opt(argc, argv, 4, "--out-json");
     uint32_t lang = info_parse_lang(lang_s);
     size_t max_in = INFO_CLI_MAX_BYTES >> 2U;
@@ -979,14 +1014,63 @@ static int info_cmd_alpha_ncd(int argc, char **argv) {
     uint8_t *cb = g_buf_c + slot_cap;
     size_t cla = info_alpha_canonicalize(&g_alpha_ws, g_buf_a, la, lang, ca, slot_cap);
     uint32_t ids_a = g_alpha_ws.unique_ids;
+    uint32_t vx_a = g_alpha_ws.vx_count;
     size_t clb = info_alpha_canonicalize(&g_alpha_ws, g_buf_b, lb, lang, cb, slot_cap);
     uint32_t ids_b = g_alpha_ws.unique_ids;
+    uint32_t vx_b = g_alpha_ws.vx_count;
 
     info_stream_eval_t a_a, a_b, a_ba, a_ab;
     info_eval_stream_bits(&g_ws, NULL, 0U, ca, cla, INFO_CODEC_FLAG_ALG, &a_a);
     info_eval_stream_bits(&g_ws, NULL, 0U, cb, clb, INFO_CODEC_FLAG_ALG, &a_b);
     info_eval_stream_bits(&g_ws, ca, cla, cb, clb, INFO_CODEC_FLAG_ALG, &a_ba);
     info_eval_stream_bits(&g_ws, cb, clb, ca, cla, INFO_CODEC_FLAG_ALG, &a_ab);
+
+    bool has_bg = false;
+    info_stream_eval_t br_a, br_b, br_ba, br_ab;
+    info_stream_eval_t ba_a, ba_b, ba_ba, ba_ab;
+    info_zero_bytes(&br_a, sizeof(br_a));
+    info_zero_bytes(&br_b, sizeof(br_b));
+    info_zero_bytes(&br_ba, sizeof(br_ba));
+    info_zero_bytes(&br_ab, sizeof(br_ab));
+    info_zero_bytes(&ba_a, sizeof(ba_a));
+    info_zero_bytes(&ba_b, sizeof(ba_b));
+    info_zero_bytes(&ba_ba, sizeof(ba_ba));
+    info_zero_bytes(&ba_ab, sizeof(ba_ab));
+
+    if (bg_p != NULL) {
+        size_t bg_len = 0U;
+        if (!info_read_file(bg_p, g_buf_bg, INFO_CLI_MAX_BYTES >> 1U, &bg_len)) {
+            (void)fprintf(stderr, "ERROR: cannot read --bg %s\n", bg_p);
+            return 1;
+        }
+        size_t cbg_len = info_alpha_canonicalize(&g_alpha_ws, g_buf_bg, bg_len, lang,
+                                                 g_buf_bg_canon, INFO_CLI_MAX_BYTES >> 1U);
+        if (bg_len + la > INFO_CLI_MAX_BYTES || bg_len + lb > INFO_CLI_MAX_BYTES ||
+            cbg_len + cla > INFO_CLI_MAX_BYTES || cbg_len + clb > INFO_CLI_MAX_BYTES) {
+            (void)fprintf(stderr, "ERROR: --bg + target exceeds INFO_CLI_MAX_BYTES\n");
+            return 1;
+        }
+        info_eval_stream_bits(&g_ws, g_buf_bg, bg_len, g_buf_a, la, INFO_CODEC_FLAG_ALG, &br_a);
+        info_eval_stream_bits(&g_ws, g_buf_bg, bg_len, g_buf_b, lb, INFO_CODEC_FLAG_ALG, &br_b);
+        memcpy(g_buf_prefix, g_buf_bg, bg_len);
+        memcpy(g_buf_prefix + bg_len, g_buf_a, la);
+        info_eval_stream_bits(&g_ws, g_buf_prefix, bg_len + la, g_buf_b, lb, INFO_CODEC_FLAG_ALG,
+                              &br_ba);
+        memcpy(g_buf_prefix + bg_len, g_buf_b, lb);
+        info_eval_stream_bits(&g_ws, g_buf_prefix, bg_len + lb, g_buf_a, la, INFO_CODEC_FLAG_ALG,
+                              &br_ab);
+
+        info_eval_stream_bits(&g_ws, g_buf_bg_canon, cbg_len, ca, cla, INFO_CODEC_FLAG_ALG, &ba_a);
+        info_eval_stream_bits(&g_ws, g_buf_bg_canon, cbg_len, cb, clb, INFO_CODEC_FLAG_ALG, &ba_b);
+        memcpy(g_buf_prefix, g_buf_bg_canon, cbg_len);
+        memcpy(g_buf_prefix + cbg_len, ca, cla);
+        info_eval_stream_bits(&g_ws, g_buf_prefix, cbg_len + cla, cb, clb, INFO_CODEC_FLAG_ALG,
+                              &ba_ba);
+        memcpy(g_buf_prefix + cbg_len, cb, clb);
+        info_eval_stream_bits(&g_ws, g_buf_prefix, cbg_len + clb, ca, cla, INFO_CODEC_FLAG_ALG,
+                              &ba_ab);
+        has_bg = true;
+    }
 
     if (out_json != NULL) {
         FILE *fp = fopen(out_json, "wb");
@@ -1003,16 +1087,35 @@ static int info_cmd_alpha_ncd(int argc, char **argv) {
                 "  \"alpha_len_b\": %zu,\n"
                 "  \"alpha_ids_a\": %u,\n"
                 "  \"alpha_ids_b\": %u,\n"
+                "  \"alpha_vx_a\": %u,\n"
+                "  \"alpha_vx_b\": %u,\n"
                 "  \"alpha_la_q12\": %llu,\n"
                 "  \"alpha_lb_q12\": %llu,\n"
                 "  \"alpha_lba_q12\": %llu,\n"
-                "  \"alpha_lab_q12\": %llu\n"
-                "}\n",
+                "  \"alpha_lab_q12\": %llu",
                 (unsigned long long)r_a.total_bits_q12, (unsigned long long)r_b.total_bits_q12,
                 (unsigned long long)r_ba.total_bits_q12, (unsigned long long)r_ab.total_bits_q12,
-                cla, clb, (unsigned)ids_a, (unsigned)ids_b, (unsigned long long)a_a.total_bits_q12,
-                (unsigned long long)a_b.total_bits_q12, (unsigned long long)a_ba.total_bits_q12,
-                (unsigned long long)a_ab.total_bits_q12);
+                cla, clb, (unsigned)ids_a, (unsigned)ids_b, (unsigned)vx_a, (unsigned)vx_b,
+                (unsigned long long)a_a.total_bits_q12, (unsigned long long)a_b.total_bits_q12,
+                (unsigned long long)a_ba.total_bits_q12, (unsigned long long)a_ab.total_bits_q12);
+        if (has_bg) {
+            fprintf(
+                fp,
+                ",\n"
+                "  \"bg_raw_la_q12\": %llu,\n"
+                "  \"bg_raw_lb_q12\": %llu,\n"
+                "  \"bg_raw_lba_q12\": %llu,\n"
+                "  \"bg_raw_lab_q12\": %llu,\n"
+                "  \"bg_alpha_la_q12\": %llu,\n"
+                "  \"bg_alpha_lb_q12\": %llu,\n"
+                "  \"bg_alpha_lba_q12\": %llu,\n"
+                "  \"bg_alpha_lab_q12\": %llu",
+                (unsigned long long)br_a.total_bits_q12, (unsigned long long)br_b.total_bits_q12,
+                (unsigned long long)br_ba.total_bits_q12, (unsigned long long)br_ab.total_bits_q12,
+                (unsigned long long)ba_a.total_bits_q12, (unsigned long long)ba_b.total_bits_q12,
+                (unsigned long long)ba_ba.total_bits_q12, (unsigned long long)ba_ab.total_bits_q12);
+        }
+        fprintf(fp, "\n}\n");
         if (fclose(fp) != 0) {
             return 1;
         }
