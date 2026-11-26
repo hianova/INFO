@@ -118,7 +118,9 @@ gate1-lean-schema: $(BUILD)/info_schema_abi.h
 	@if grep -qE '^\s*(theorem|lemma|axiom)\s' Info.lean; then \
 		echo "ERROR: theorems/lemmas/axioms not allowed in Info.lean"; exit 1; \
 	fi
-	LEAN_PATH=$(BUILD)/lean:$(FLOW_DIR)/build/lean $(LEANCHECKER) Info
+	@rm -rf $(BUILD)/lean_schema_check && mkdir -p $(BUILD)/lean_schema_check && cp $(BUILD)/lean/Info.olean $(BUILD)/lean_schema_check/Info.olean
+	LEAN_PATH=$(BUILD)/lean_schema_check:$(FLOW_DIR)/build/lean $(LEANCHECKER) Info
+	@rm -rf $(BUILD)/lean_schema_check
 	@if grep -q 'memcpy' $(BUILD)/info_schema_abi.h; then \
 		echo "ERROR: memcpy found in generated ABI header"; exit 1; \
 	fi
