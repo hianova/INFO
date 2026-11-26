@@ -99,6 +99,9 @@ def distill_module(
     targets: Optional[List[str]],
     max_pairs: int = 40,
     min_proof_dag: int = 10,
+    source_files: Optional[List[Path]] = None,
+    olean_bytes: Optional[int] = None,
+    infp_v2_bytes: Optional[int] = None,
 ) -> Dict[str, object]:
     assert INFO_BIN.is_file(), f"Missing {INFO_BIN}; run `make all` first."
     assert EXPORTER.is_file(), f"Missing {EXPORTER}"
@@ -327,19 +330,88 @@ def distill_module(
         clone_clusters.sort(key=lambda c: -float(c["delta_mdl_bytes"]))
 
         axioms_used = sorted({ax for d in decls for ax in d["axioms"]})  # type: ignore[attr-defined]
+
+        # 5. Interface Over-Specification Audit: Dead Structure Fields & Unused Theorem Hypotheses
+        live_proj_uses: Set[str] = {
+            str(p)
+            for d in decls
+            if str(d["name"]) in live_set
+            for p in d.get("proj_uses", [])  # type: ignore[attr-defined]
+        }
+        live_deps: Set[str] = {
+            str(dep)
+            for d in decls
+            if str(d["name"]) in live_set
+            for dep in d.get("deps", [])  # type: ignore[attr-defined]
+        }
+        structures = list(raw.get("structures", []))  # type: ignore[arg-type]
+        dead_fields: List[Dict[str, object]] = []
+        for st in structures:
+            sname = str(st["name"])
+            fields = [str(f) for f in st.get("fields", [])]  # type: ignore[union-attr]
+            is_live_struct = (
+                any(dep == sname or dep.startswith(sname + ".") for dep in live_deps)
+                or any(p.startswith(sname + "#") for p in live_proj_uses)
+            )
+            if not is_live_struct:
+                continue
+            for fidx, fname in enumerate(fields):
+                if f"{sname}#{fidx}" not in live_proj_uses and f"{sname}.{fname}" not in live_deps:
+                    dead_fields.append({"structure": sname, "field": fname, "index": fidx})
+
+        unused_hyps: List[Dict[str, object]] = []
+        for d in user_decls:
+            nm = str(d["name"])
+            hyps = list(d.get("unused_hyps", []))  # type: ignore[arg-type]
+            if nm in live_set and hyps:
+                unused_hyps.append({"name": nm, "hyps": hyps})
+
+        # 6. Dual-Layer Proof MDL (L_source vs L_kernel & .olean Bloat Telemetry)
+        dual_layer_mdl: Dict[str, object] = {
+            "total_dag_nodes": total_dag,
+            "total_tree_nodes": total_tree,
+            "kernel_expr_mdl_bytes": alpha_mdl["mdl_bytes"],
+        }
+        if source_files:
+            existing_srcs = [p for p in source_files if p.is_file()]
+            if existing_srcs:
+                src_concat = tdir / "source_concat.lean"
+                src_concat.write_bytes(b"\n".join(p.read_bytes() for p in existing_srcs))
+                src_m = eval_bpb(src_concat, tdir / "src_bpb.json")
+                dual_layer_mdl["source_orig_bytes"] = src_m["orig_bytes"]
+                dual_layer_mdl["source_mdl_bytes"] = src_m["mdl_bytes"]
+                dual_layer_mdl["source_bpb"] = src_m["bpb"]
+                dual_layer_mdl["tactic_leverage_dag_per_src_b"] = round(
+                    total_dag / max(1.0, float(src_m["mdl_bytes"])), 3
+                )
+        if infp_v2_bytes is not None:
+            dual_layer_mdl["infp_v2_bytes"] = int(infp_v2_bytes)
+            if "source_mdl_bytes" in dual_layer_mdl:
+                dual_layer_mdl["kernel_to_source_ratio"] = round(
+                    float(infp_v2_bytes) / max(1.0, float(dual_layer_mdl["source_mdl_bytes"])), 3
+                )
+        if olean_bytes is not None:
+            dual_layer_mdl["olean_bytes"] = int(olean_bytes)
+            if infp_v2_bytes is not None and infp_v2_bytes > 0:
+                dual_layer_mdl["olean_to_infp_ratio"] = round(float(olean_bytes) / float(infp_v2_bytes), 2)
+
         return {
             "module": module,
             "prefix": prefix,
             "decl_count": len(user_decls),
             "live_count": live_user_count,
             "dead_count": len(dead_decls),
+            "structures_count": len(structures),
             "total_tree_nodes": total_tree,
             "total_dag_nodes": total_dag,
             "dag_share_ratio": round(dag_ratio, 2),
             "raw_expr_mdl": raw_mdl,
             "alpha_expr_mdl": alpha_mdl,
+            "dual_layer_mdl": dual_layer_mdl,
             "axioms_used": axioms_used,
             "dead_decls": dead_decls,
+            "dead_fields": dead_fields,
+            "unused_hyps": unused_hyps,
             "clone_pairs": clone_pairs,
             "clone_clusters": clone_clusters,
             "blueprint_top": blueprint[:15],
@@ -390,6 +462,16 @@ def render_markdown(rep: Dict[str, object]) -> str:
         lines.append(
             f"| {idx} | `{b['name']}` | `{b['reverse_reach']}` | `{b['in_degree']}` | `{b['proof_dag_nodes']}` |"
         )
+    dual = rep.get("dual_layer_mdl", {})  # type: ignore[assignment]
+    if isinstance(dual, dict) and "source_mdl_bytes" in dual:
+        lines.extend([
+            "",
+            "## 4. Dual-Layer Proof MDL & Interface Audit",
+            "",
+            f"- **Source MDL (`L_source`)**: `{dual['source_orig_bytes']:.0f} B` -> `{dual['source_mdl_bytes']:.1f} B` (`{dual['source_bpb']} bpb`)",
+            f"- **Tactic Leverage (`DAG / L_source`)**: `{dual['tactic_leverage_dag_per_src_b']} nodes/B`",
+            f"- **Dead Structure Fields**: `{len(rep.get('dead_fields', []))}` | **Unused Theorem Hypotheses**: `{len(rep.get('unused_hyps', []))}`",
+        ])
     lines.append("")
     return "\n".join(lines)
 
@@ -402,11 +484,14 @@ def main() -> int:
     parser.add_argument("--targets", default=None, help="Comma-separated target declarations")
     parser.add_argument("--max-pairs", type=int, default=40)
     parser.add_argument("--min-proof-dag", type=int, default=10)
+    parser.add_argument("--source-files", default=None, help="Comma-separated .lean source files for L_source")
+    parser.add_argument("--olean-bytes", type=int, default=None)
     parser.add_argument("--out-json", type=Path, default=None)
     parser.add_argument("--out-md", type=Path, default=None)
     args = parser.parse_args()
 
     tlist = [t.strip() for t in args.targets.split(",") if t.strip()] if args.targets else None
+    sfiles = [Path(s.strip()) for s in args.source_files.split(",") if s.strip()] if args.source_files else None
     rep = distill_module(
         args.module,
         args.prefix,
@@ -414,6 +499,8 @@ def main() -> int:
         tlist,
         max_pairs=args.max_pairs,
         min_proof_dag=args.min_proof_dag,
+        source_files=sfiles,
+        olean_bytes=args.olean_bytes,
     )
     raw_m = rep["raw_expr_mdl"]  # type: ignore[index]
     alp_m = rep["alpha_expr_mdl"]  # type: ignore[index]

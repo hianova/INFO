@@ -36,7 +36,8 @@ def jsonEscape (s : String) : String :=
 
 def isInternalDecl (s : String) : Bool :=
   let parts := ["_cstage", "_boxed", "_sunfold", "._unsafe_rec", ".match_",
-    ".eq_", ".rec", ".casesOn", ".noConfusion", ".below", ".brecOn", ".sizeOf_spec"]
+    ".eq_", ".rec", ".casesOn", ".noConfusion", ".below", ".brecOn", ".sizeOf_spec",
+    "._sizeOf_", ".ctorIdx", "._flat_ctor", ".injEq", ".inj"]
   parts.any fun pat => (s.splitOn pat).length > 1
 
 def matchesPrefix (s rootPrefix : String) : Bool :=
@@ -64,6 +65,7 @@ structure WalkState where
   dagNodes : Nat := 0
   deps : Std.HashSet String := {}
   axioms : Std.HashSet String := {}
+  projUses : Std.HashSet String := {}
   tokens : Array String := #[]
 
 def pushTok (st : WalkState) (tok : String) : WalkState :=
@@ -130,8 +132,9 @@ partial def walkExpr (e : Expr) (st : WalkState) : (Nat × Nat) × WalkState :=
       | .mdata _ inner =>
         let ((_, s1), st1) := walkExpr inner st
         (s1, st1)
-      | .proj _ idx struct =>
-        let st0 := pushTok st s!"PR BV{idx}"
+      | .proj typeName idx struct =>
+        let stP : WalkState := { st with projUses := st.projUses.insert s!"{typeName}#{idx}" }
+        let st0 := pushTok stP s!"PR BV{idx}"
         let ((_, s1), st1) := walkExpr struct st0
         (satAdd 1 s1, st1)
     let nid := st1.nextId
@@ -150,6 +153,21 @@ def encodeStrArray (xs : Array String) : String :=
 def splitColonPaths (s : String) : List System.FilePath :=
   (s.splitOn ":").filter (· != "") |>.map System.FilePath.mk
 
+partial def collectUnusedHypsAux (pos : Nat) (ty val : Expr) (acc : Array String) : Array String :=
+  match ty, val with
+  | .forallE bn _ bodyTy _, .lam _ _ bodyVal _ =>
+    let acc' :=
+      if !bodyTy.hasLooseBVar 0 && !bodyVal.hasLooseBVar 0 then
+        let s := bn.toString
+        let label := if s.isEmpty || s == "[anonymous]" then s!"_arg{pos}" else s
+        acc.push label
+      else acc
+    collectUnusedHypsAux (pos + 1) bodyTy bodyVal acc'
+  | _, _ => acc
+
+def collectUnusedHyps (ty val : Expr) : Array String :=
+  collectUnusedHypsAux 0 ty val #[]
+
 def runExport (modStr rootPrefix outPathStr : String) (extraPaths : List System.FilePath) : IO Unit := do
   let sysroot ← Lean.findSysroot
   let sp := if extraPaths.isEmpty then [System.FilePath.mk "build/lean"] else extraPaths
@@ -157,7 +175,20 @@ def runExport (modStr rootPrefix outPathStr : String) (extraPaths : List System.
   let modName := String.toName modStr
   let env ← Lean.importModules #[{ module := modName }] {}
 
-  let mut entries : Array (String × String × Nat × Nat × Nat × Nat × Array String × Array String × String) := #[]
+  let mut structEntries : Array (String × Array String) := #[]
+  for (name, _) in env.constants.map₁.toList do
+    let s := name.toString
+    if matchesPrefix s rootPrefix && !isInternalDecl s then
+      if let some sinfo := Lean.getStructureInfo? env name then
+        structEntries := structEntries.push (s, sinfo.fieldNames.map Lean.Name.toString)
+  let sortedStructs := structEntries.qsort (fun a b => a.1 < b.1)
+  let mut structJsons : Array String := #[]
+  for (snm, fields) in sortedStructs do
+    structJsons := structJsons.push (
+      "    {\"name\": \"" ++ jsonEscape snm ++ "\", \"fields\": " ++ encodeStrArray fields ++ "}"
+    )
+
+  let mut entries : Array (String × String × Nat × Nat × Nat × Nat × Array String × Array String × Array String × Array String × String) := #[]
   for (name, cinfo) in env.constants.map₁.toList do
     let s := name.toString
     if !matchesPrefix s rootPrefix || isInternalDecl s then
@@ -183,12 +214,14 @@ def runExport (modStr rootPrefix outPathStr : String) (extraPaths : List System.
       let valDag := stFin.dagNodes - tyDag
       let depsArr := (stFin.deps.toList.mergeSort (· < ·)).toArray
       let axArr := (stFin.axioms.toList.mergeSort (· < ·)).toArray
+      let projArr := (stFin.projUses.toList.mergeSort (· < ·)).toArray
+      let unusedArr := if kind == "thm" then collectUnusedHyps tyExpr valExpr else #[]
       let tokStr := String.intercalate " " stFin.tokens.toList
-      entries := entries.push (s, kind, tyTree, tyDag, valTree, valDag, depsArr, axArr, tokStr)
+      entries := entries.push (s, kind, tyTree, tyDag, valTree, valDag, depsArr, axArr, projArr, unusedArr, tokStr)
 
   let sorted := entries.qsort (fun a b => a.1 < b.1)
   let mut declJsons : Array String := #[]
-  for (nm, kind, tyT, tyD, valT, valD, depsArr, axArr, tokStr) in sorted do
+  for (nm, kind, tyT, tyD, valT, valD, depsArr, axArr, projArr, unusedArr, tokStr) in sorted do
     let item :=
       "    {\n" ++
       s!"      \"name\": \"{jsonEscape nm}\",\n" ++
@@ -199,6 +232,8 @@ def runExport (modStr rootPrefix outPathStr : String) (extraPaths : List System.
       s!"      \"proof_dag_nodes\": {valD},\n" ++
       s!"      \"deps\": {encodeStrArray depsArr},\n" ++
       s!"      \"axioms\": {encodeStrArray axArr},\n" ++
+      s!"      \"proj_uses\": {encodeStrArray projArr},\n" ++
+      s!"      \"unused_hyps\": {encodeStrArray unusedArr},\n" ++
       s!"      \"expr_tokens\": \"{jsonEscape tokStr}\"\n" ++
       "    }"
     declJsons := declJsons.push item
@@ -208,6 +243,9 @@ def runExport (modStr rootPrefix outPathStr : String) (extraPaths : List System.
     s!"  \"module\": \"{jsonEscape modStr}\",\n" ++
     s!"  \"prefix\": \"{jsonEscape rootPrefix}\",\n" ++
     s!"  \"decl_count\": {sorted.size},\n" ++
+    "  \"structures\": [\n" ++
+    String.intercalate ",\n" structJsons.toList ++
+    "\n  ],\n" ++
     "  \"decls\": [\n" ++
     String.intercalate ",\n" declJsons.toList ++
     "\n  ]\n}\n"
@@ -744,7 +782,8 @@ private def jsonObjNat (j : Lean.Json) (key : String) : IO Nat := do
   let v ← unwrapExcept s!"missing {key}" (j.getObjVal? key)
   unwrapExcept s!"expected nat at {key}" v.getNat?
 
-def runVerifyDag (dagJsonPath : String) (baseModules : List String) (extraPaths : List System.FilePath) : IO Unit := do
+def replayDagToKernelEnv (dagJsonPath : String) (baseModules : List String)
+    (extraPaths : List System.FilePath) : IO (Lean.Kernel.Environment × Nat × Nat × Nat) := do
   let sysroot ← Lean.findSysroot
   Lean.initSearchPath sysroot extraPaths
   let baseMods := if baseModules.isEmpty then ["Init"] else baseModules
@@ -1057,7 +1096,110 @@ def runVerifyDag (dagJsonPath : String) (baseModules : List String) (extraPaths 
       let msg ← (ex.toMessageData Lean.Options.empty).toString
       throw (IO.userError s!"Kernel rejected declaration {u.primaryName}: {msg}")
 
+  return (kenv, nInd, nDef, nThm)
+
+def runVerifyDag (dagJsonPath : String) (baseModules : List String)
+    (extraPaths : List System.FilePath) : IO Unit := do
+  let (_, nInd, nDef, nThm) ← replayDagToKernelEnv dagJsonPath baseModules extraPaths
   IO.println s!"[verify-dag] KERNEL PASS: inducts={nInd} defs={nDef} thms={nThm} (0 sorryAx, 0 ofReduceBool)"
+
+private def collectTransitiveAxioms (kenv : Lean.Kernel.Environment)
+    (roots : Array Lean.Name) : Array String := Id.run do
+  let mut visited : Std.HashSet Lean.Name := ∅
+  let mut worklist : Array Lean.Name := #[]
+  let mut axioms : Std.HashSet String := ∅
+  for r in roots do
+    if !visited.contains r then
+      visited := visited.insert r
+      worklist := worklist.push r
+  let mut qh := 0
+  while qh < worklist.size do
+    let nm := worklist[qh]!
+    qh := qh + 1
+    if let some cinfo := kenv.find? nm then
+      match cinfo with
+      | .axiomInfo _ =>
+        axioms := axioms.insert nm.toString
+      | _ =>
+        let act : StateM (Std.HashSet Lean.Expr × Array Lean.Name) Unit := do
+          scanExprConstsAux cinfo.type
+          match cinfo with
+          | .thmInfo v => scanExprConstsAux v.value
+          | .defnInfo v => scanExprConstsAux v.value
+          | .opaqueInfo v => scanExprConstsAux v.value
+          | _ => pure ()
+        let deps := (act.run (∅, #[])).2.2
+        for dep in deps do
+          if !visited.contains dep then
+            visited := visited.insert dep
+            worklist := worklist.push dep
+  return (axioms.toList.mergeSort (· < ·)).toArray
+
+private def jsonObjStrArrOpt (j : Lean.Json) (key : String) : IO (Option (Array String)) := do
+  match j.getObjVal? key with
+  | .error _ => return none
+  | .ok .null => return none
+  | .ok v =>
+    let arr ← unwrapExcept s!"expected array at {key}" v.getArr?
+    let xs ← arr.mapM fun el => unwrapExcept s!"expected str in {key}" el.getStr?
+    return some xs
+
+private def jsonObjStrOpt (j : Lean.Json) (key : String) : IO (Option String) := do
+  match j.getObjVal? key with
+  | .error _ => return none
+  | .ok .null => return none
+  | .ok v =>
+    let s ← unwrapExcept s!"expected str at {key}" v.getStr?
+    return if s.isEmpty then none else some s
+
+def runVerifyContract (dagJsonPath contractJsonPath : String) (baseModules : List String)
+    (extraPaths : List System.FilePath) : IO Unit := do
+  let (kenv, nInd, nDef, nThm) ← replayDagToKernelEnv dagJsonPath baseModules extraPaths
+  let cRaw ← IO.FS.readFile (System.FilePath.mk contractJsonPath)
+  let cJson ← unwrapExcept "Contract JSON parse failed" (Lean.Json.parse cRaw)
+  let thmNames ← jsonObjStrArr cJson "theorem_names"
+  if thmNames.isEmpty then
+    throw (IO.userError "Contract theorem_names must be non-empty")
+  let permitted := (← jsonObjStrArrOpt cJson "permitted_axioms").getD #["propext", "Quot.sound", "Classical.choice"]
+  let chalModOpt ← jsonObjStrOpt cJson "challenge_module"
+  let forbiddenImports := (← jsonObjStrArrOpt cJson "forbidden_imports").getD #[]
+
+  let mut chalEnvOpt : Option Lean.Environment := none
+  if let some chalMod := chalModOpt then
+    let chalEnv ← Lean.importModules #[{ module := chalMod.toName : Lean.Import }] {}
+    for imp in chalEnv.header.imports do
+      let impStr := imp.module.toString
+      for forb in forbiddenImports do
+        if impStr == forb || impStr.startsWith (forb ++ ".") || impStr.endsWith ("." ++ forb) then
+          throw (IO.userError s!"TCB isolation violation: challenge module imports forbidden '{impStr}'")
+    chalEnvOpt := some chalEnv
+
+  let mut roots : Array Lean.Name := #[]
+  for thmStr in thmNames do
+    let thmNm := strToName thmStr
+    roots := roots.push thmNm
+    match kenv.find? thmNm with
+    | some (.thmInfo solVal) =>
+      if let some chalEnv := chalEnvOpt then
+        match chalEnv.find? thmNm with
+        | some chalInfo =>
+          if solVal.levelParams != chalInfo.levelParams then
+            throw (IO.userError s!"Contract levelParams mismatch for {thmStr}")
+          if !Lean.Expr.eqv solVal.type chalInfo.type then
+            throw (IO.userError s!"Contract type mismatch for {thmStr}")
+        | none =>
+          throw (IO.userError s!"Challenge module missing theorem {thmStr}")
+    | _ =>
+      throw (IO.userError s!"Replayed kernel environment missing theorem {thmStr}")
+
+  let axiomsUsed := collectTransitiveAxioms kenv roots
+  for ax in axiomsUsed do
+    if !permitted.contains ax then
+      throw (IO.userError s!"Disallowed axiom in contract closure: {ax}")
+
+  let chalLabel := chalModOpt.getD "(none)"
+  let axList := String.intercalate "," axiomsUsed.toList
+  IO.println s!"[verify-contract] CONTRACT PASS: thms={thmNames.size} challenge={chalLabel} axioms=[{axList}] (replayed inducts={nInd} defs={nDef} thms={nThm})"
 
 end LeanDagExport
 
@@ -1078,10 +1220,17 @@ def main (args : List String) : IO UInt32 := do
     let paths := searchRest.foldl (fun acc arg => acc ++ LeanExprExport.splitColonPaths arg) []
     LeanDagExport.runVerifyDag dagJsonPath baseMods paths
     return 0
+  | "verify-contract" :: dagJsonPath :: contractJsonPath :: rest =>
+    let (baseMods, searchRest) := match rest with
+      | b :: sr => (b.splitOn ",", sr)
+      | [] => (["Init"], [])
+    let paths := searchRest.foldl (fun acc arg => acc ++ LeanExprExport.splitColonPaths arg) []
+    LeanDagExport.runVerifyContract dagJsonPath contractJsonPath baseMods paths
+    return 0
   | modStr :: rootPrefix :: outPathStr :: rest =>
     let paths := rest.foldl (fun acc arg => acc ++ LeanExprExport.splitColonPaths arg) []
     LeanExprExport.runExport modStr rootPrefix outPathStr paths
     return 0
   | _ =>
-    IO.eprintln "Usage: lean --run lean_expr_export.lean [export-dag [--with-internal-deps] | verify-dag] ..."
+    IO.eprintln "Usage: lean --run lean_expr_export.lean [export-dag [--with-internal-deps] | verify-dag | verify-contract] ..."
     return 1

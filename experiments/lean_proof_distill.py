@@ -39,6 +39,14 @@ BLOATED_LEAN = """/- Synthetic bloated Lean proof module for soundness-preservin
 
 namespace BloatedDemo
 
+structure DemoCfg where
+  scale : Nat
+  unused_meta : Nat
+
+theorem helper_over_spec (cfg : DemoCfg) (_h_unused : 0 = 0) :
+    cfg.scale + 0 = cfg.scale := by
+  omega
+
 theorem dead_thm_1 (a b : Nat) : a + b + (a + b) = 2 * (a + b) := by
   omega
 
@@ -90,14 +98,22 @@ theorem headline_main (g1 g2 : Nat → Nat) (s1 s2 s3 s4 : List Nat) :
   have h2 := iso_b g2 s2
   have h3 := iso_c g1 s3
   have h4 := iso_d g2 s4
+  have hcfg := helper_over_spec { scale := s1.length, unused_meta := 99 } rfl
   omega
 
 end BloatedDemo
 """
 
-DISTILLED_LEAN = """/- Soundness-preserving distilled module: 0 dead lemmas, shared polymorphic core -/
+DISTILLED_LEAN = """/- Soundness-preserving distilled module: 0 dead lemmas, minimal interface, shared core -/
 
 namespace DistilledDemo
+
+structure DemoCfg where
+  scale : Nat
+
+theorem helper_minimal (cfg : DemoCfg) :
+    cfg.scale + 0 = cfg.scale := by
+  omega
 
 theorem shared_rev_map_len (f : Nat → Nat) (xs : List Nat) :
     ((xs.map f).reverse).length = xs.length := by
@@ -116,6 +132,7 @@ theorem headline_main (g1 g2 : Nat → Nat) (s1 s2 s3 s4 : List Nat) :
   have h2 := shared_rev_map_len g2 s2
   have h3 := shared_rev_map_len g1 s3
   have h4 := shared_rev_map_len g2 s4
+  have hcfg := helper_minimal { scale := s1.length }
   omega
 
 end DistilledDemo
@@ -167,15 +184,37 @@ def run_part1_soundness_preserving_compression() -> None:
         out_dist = _compile_and_check(lean_bin, p_dist, o_dist, "DistilledDemo", tdir)
 
         rep_b = distill_module(
-            "BloatedDemo", "BloatedDemo", str(tdir), targets=["BloatedDemo.headline_main"]
+            "BloatedDemo",
+            "BloatedDemo",
+            str(tdir),
+            targets=["BloatedDemo.headline_main"],
+            source_files=[p_bloat],
+            olean_bytes=o_bloat.stat().st_size,
         )
         rep_d = distill_module(
-            "DistilledDemo", "DistilledDemo", str(tdir), targets=["DistilledDemo.headline_main"]
+            "DistilledDemo",
+            "DistilledDemo",
+            str(tdir),
+            targets=["DistilledDemo.headline_main"],
+            source_files=[p_dist],
+            olean_bytes=o_dist.stat().st_size,
         )
 
         dead_names = {d["name"] for d in rep_b["dead_decls"]}  # type: ignore[attr-defined]
-        assert dead_names == {"BloatedDemo.dead_thm_1", "BloatedDemo.dead_thm_2"}, dead_names
+        assert dead_names == {
+            "BloatedDemo.dead_thm_1",
+            "BloatedDemo.dead_thm_2",
+            "BloatedDemo.DemoCfg.unused_meta",
+        }, dead_names
         assert rep_d["dead_count"] == 0, rep_d["dead_decls"]
+
+        dead_fields_b = {(df["structure"], df["field"]) for df in rep_b["dead_fields"]}  # type: ignore[attr-defined]
+        assert ("BloatedDemo.DemoCfg", "unused_meta") in dead_fields_b, rep_b["dead_fields"]
+        assert len(rep_d["dead_fields"]) == 0, rep_d["dead_fields"]  # type: ignore[arg-type]
+
+        unused_b = {u["name"]: u["hyps"] for u in rep_b["unused_hyps"]}  # type: ignore[attr-defined]
+        assert "_h_unused" in unused_b.get("BloatedDemo.helper_over_spec", []), rep_b["unused_hyps"]
+        assert len(rep_d["unused_hyps"]) == 0, rep_d["unused_hyps"]  # type: ignore[arg-type]
 
         clusters = rep_b["clone_clusters"]  # type: ignore[assignment]
         assert len(clusters) >= 1 and len(clusters[0]["members"]) == 4, clusters
@@ -190,43 +229,49 @@ def run_part1_soundness_preserving_compression() -> None:
         dag_d = int(rep_d["total_dag_nodes"])  # type: ignore[arg-type]
         mdl_b = float(rep_b["alpha_expr_mdl"]["mdl_bytes"])  # type: ignore[index]
         mdl_d = float(rep_d["alpha_expr_mdl"]["mdl_bytes"])  # type: ignore[index]
-        assert dag_d < dag_b and mdl_d < mdl_b
+        src_mdl_b = float(rep_b["dual_layer_mdl"]["source_mdl_bytes"])  # type: ignore[index]
+        src_mdl_d = float(rep_d["dual_layer_mdl"]["source_mdl_bytes"])  # type: ignore[index]
+        assert dag_d < dag_b and mdl_d < mdl_b and src_mdl_d < src_mdl_b
 
         print(
-            f"    BloatedDemo  : decls={rep_b['decl_count']} (dead=2), clones=4 "
-            f"(ΔMDL={clusters[0]['delta_mdl_bytes']:+.1f} B), DAG={dag_b}, α-MDL={mdl_b:.1f} B"
+            f"    BloatedDemo  : decls={rep_b['decl_count']} (dead=2, dead_fields={len(rep_b['dead_fields'])}, "  # type: ignore[arg-type]
+            f"unused_hyps={len(rep_b['unused_hyps'])}), clones=4 (ΔMDL={clusters[0]['delta_mdl_bytes']:+.1f} B), "  # type: ignore[arg-type]
+            f"L_src={src_mdl_b:.1f} B, DAG={dag_b}, α-MDL={mdl_b:.1f} B"
         )
         print(
-            f"    DistilledDemo: decls={rep_d['decl_count']} (dead=0), leanchecker PASS, "
-            f"DAG={dag_d} (-{dag_b - dag_d}), α-MDL={mdl_d:.1f} B (-{mdl_b - mdl_d:.1f} B)"
+            f"    DistilledDemo: decls={rep_d['decl_count']} (dead=0, dead_fields=0, unused_hyps=0), leanchecker PASS, "
+            f"L_src={src_mdl_d:.1f} B (-{src_mdl_b - src_mdl_d:.1f} B), DAG={dag_d} (-{dag_b - dag_d}), α-MDL={mdl_d:.1f} B (-{mdl_b - mdl_d:.1f} B)"
         )
 
 
 def run_part2_ecosystem_lean_audit() -> None:
     print("  --- Part 2: Live Ecosystem Lean Kernel Proof-DAG Audit ---")
-    candidates: List[Tuple[str, str, str, Path]] = [
-        ("Info.Theory", "Info", str(ROOT / "build" / "lean"), ROOT / "build" / "lean" / "Info" / "Theory.olean"),
-        ("Flow.Math", "Flow", str(ROOT.parent / "FLOW" / "build" / "lean"), ROOT.parent / "FLOW" / "build" / "lean" / "Flow" / "Math.olean"),
-        ("Sound.Theory", "Sound", str(ROOT.parent / "SOUND" / "build" / "lean"), ROOT.parent / "SOUND" / "build" / "lean" / "Sound" / "Theory.olean"),
-        ("Phy.Noether", "Phy", f"{ROOT.parent / 'PHY' / 'build' / 'lean'}:{ROOT.parent / 'FLOW' / 'build' / 'lean'}", ROOT.parent / "PHY" / "build" / "lean" / "Phy" / "Noether.olean"),
-        ("EleCert", "EleCert", f"{ROOT.parent / 'FLOW' / 'build' / 'lean'}:{ROOT.parent / 'ELE' / 'build'}", ROOT.parent / "ELE" / "build" / "EleCert.olean"),
-        ("EconCert", "EconCert", f"{ROOT.parent / 'FLOW' / 'build' / 'lean'}:{ROOT.parent / 'ECON' / 'build'}", ROOT.parent / "ECON" / "build" / "EconCert.olean"),
-        ("ChemCert", "ChemCert", str(ROOT.parent / "FLOW" / "build" / "lean") + ":" + str(ROOT.parent / "CHEM" / "build"), ROOT.parent / "CHEM" / "build" / "ChemCert.olean"),
+    candidates: List[Tuple[str, str, str, Path, List[Path]]] = [
+        ("Info.Theory", "Info", str(ROOT / "build" / "lean"), ROOT / "build" / "lean" / "Info" / "Theory.olean", sorted((ROOT / "Info").glob("*.lean"))),
+        ("Flow.Math", "Flow", str(ROOT.parent / "FLOW" / "build" / "lean"), ROOT.parent / "FLOW" / "build" / "lean" / "Flow" / "Math.olean", sorted((ROOT.parent / "FLOW" / "core" / "lean" / "Flow").glob("*.lean")) + sorted((ROOT.parent / "FLOW" / "sdk" / "lean" / "Flow").glob("*.lean"))),
+        ("Sound.Theory", "Sound", str(ROOT.parent / "SOUND" / "build" / "lean"), ROOT.parent / "SOUND" / "build" / "lean" / "Sound" / "Theory.olean", []),
+        ("Phy.Noether", "Phy", f"{ROOT.parent / 'PHY' / 'build' / 'lean'}:{ROOT.parent / 'FLOW' / 'build' / 'lean'}", ROOT.parent / "PHY" / "build" / "lean" / "Phy" / "Noether.olean", []),
+        ("EleCert", "EleCert", f"{ROOT.parent / 'FLOW' / 'build' / 'lean'}:{ROOT.parent / 'ELE' / 'build'}", ROOT.parent / "ELE" / "build" / "EleCert.olean", []),
+        ("EconCert", "EconCert", f"{ROOT.parent / 'FLOW' / 'build' / 'lean'}:{ROOT.parent / 'ECON' / 'build'}", ROOT.parent / "ECON" / "build" / "EconCert.olean", []),
+        ("ChemCert", "ChemCert", str(ROOT.parent / "FLOW" / "build" / "lean") + ":" + str(ROOT.parent / "CHEM" / "build"), ROOT.parent / "CHEM" / "build" / "ChemCert.olean", []),
     ]
     audited = 0
-    for mod, pfx, lpath, olean in candidates:
+    for mod, pfx, lpath, olean, src_files in candidates:
         if not olean.is_file():
             continue
-        rep = distill_module(mod, pfx, lpath, targets=None, max_pairs=32, min_proof_dag=14)
+        rep = distill_module(mod, pfx, lpath, targets=None, max_pairs=32, min_proof_dag=14, source_files=src_files or None)
         axioms = set(rep["axioms_used"])  # type: ignore[arg-type]
         assert "sorryAx" not in axioms and "Lean.ofReduceBool" not in axioms, f"Illegal axiom in {mod}: {axioms}"
         raw_m = rep["raw_expr_mdl"]  # type: ignore[index]
         alp_m = rep["alpha_expr_mdl"]  # type: ignore[index]
         top_bp = rep["blueprint_top"][0]["name"] if rep["blueprint_top"] else "-"  # type: ignore[index]
+        dual = rep.get("dual_layer_mdl", {})  # type: ignore[assignment]
+        src_tag = f" src={dual['source_mdl_bytes']:.0f}B" if isinstance(dual, dict) and "source_mdl_bytes" in dual else ""
         print(
-            f"    {mod:<13} | decls={rep['decl_count']:<3} dead={rep['dead_count']:<2} | "
+            f"    {mod:<13} | decls={rep['decl_count']:<3} dead={rep['dead_count']:<2} "
+            f"df={len(rep.get('dead_fields', [])):<2} uh={len(rep.get('unused_hyps', [])):<2} | "  # type: ignore[arg-type]
             f"tree={rep['total_tree_nodes']:<8} dag={rep['total_dag_nodes']:<6} ({rep['dag_share_ratio']}x) | "
-            f"MDL {raw_m['mdl_bytes']:>6.1f}B -> α:{alp_m['mdl_bytes']:>6.1f}B | "
+            f"MDL {raw_m['mdl_bytes']:>6.1f}B -> α:{alp_m['mdl_bytes']:>6.1f}B{src_tag} | "
             f"clones={len(rep['clone_clusters'])} | core={top_bp}"
         )
         audited += 1

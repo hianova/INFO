@@ -18,6 +18,9 @@ import argparse
 import collections
 import hashlib
 import json
+import os
+import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -972,6 +975,105 @@ def unpack_infp_to_dag(
     return dag, actual_sha.hex()
 
 
+def _strip_lean_comments(text: str) -> List[str]:
+    """Strip `--` line comments and nested `/- ... -/` block comments from Lean source."""
+    out_lines: List[str] = []
+    block_depth = 0
+    for ln in text.splitlines():
+        buf: List[str] = []
+        i = 0
+        n = len(ln)
+        in_str = False
+        while i < n:
+            if block_depth > 0:
+                if i + 1 < n and ln[i] == "/" and ln[i + 1] == "-":
+                    block_depth += 1
+                    i += 2
+                elif i + 1 < n and ln[i] == "-" and ln[i + 1] == "/":
+                    block_depth -= 1
+                    i += 2
+                else:
+                    i += 1
+            elif in_str:
+                ch = ln[i]
+                buf.append(ch)
+                if ch == "\\" and i + 1 < n:
+                    buf.append(ln[i + 1])
+                    i += 2
+                elif ch == '"':
+                    in_str = False
+                    i += 1
+                else:
+                    i += 1
+            else:
+                if i + 1 < n and ln[i] == "-" and ln[i + 1] == "-":
+                    break
+                elif i + 1 < n and ln[i] == "/" and ln[i + 1] == "-":
+                    block_depth += 1
+                    i += 2
+                else:
+                    ch = ln[i]
+                    buf.append(ch)
+                    if ch == '"':
+                        in_str = True
+                    i += 1
+        out_lines.append("".join(buf))
+    return out_lines
+
+
+def check_challenge_tcb_hygiene(challenge_src: Path, forbidden_imports: Sequence[str] = ()) -> None:
+    """Verify isolated Challenge/Statements file sets no global simp/instance/option tuning."""
+    lines = _strip_lean_comments(challenge_src.read_text(encoding="utf-8"))
+    for idx, ln in enumerate(lines, 1):
+        st = ln.strip()
+        if not st:
+            continue
+        if re.search(r"\battribute\s*\[[^\]]*\b(instance|simp)\b", st):
+            raise ValueError(f"TCB hygiene violation at {challenge_src}:{idx}: {st}")
+        if re.match(r"^set_option\b", st):
+            raise ValueError(f"TCB hygiene violation (set_option) at {challenge_src}:{idx}: {st}")
+        m_imp = re.match(r"^import\s+(\S+)", st)
+        if m_imp:
+            imp = m_imp.group(1)
+            for forb in forbidden_imports:
+                if imp == forb or imp.startswith(forb + ".") or imp.endswith("." + forb):
+                    raise ValueError(f"TCB hygiene violation (forbidden import '{imp}') at {challenge_src}:{idx}")
+
+
+def verify_infp_contract(
+    infp_path: Path,
+    contract_path: Path,
+    base_modules: str,
+    search_paths: Sequence[str] = (),
+    challenge_source: Optional[Path] = None,
+    decomp_bin: Path = DEFAULT_DECOMP_BIN,
+    lean_bin: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Unpack .infp via info_decomp, enforce Challenge TCB hygiene, and verify kernel contract."""
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    if challenge_source is not None:
+        check_challenge_tcb_hygiene(challenge_source, contract.get("forbidden_imports", ()))
+
+    dag, sha_hex = unpack_infp_to_dag(infp_path, decomp_bin)
+    lean_exe = str(lean_bin) if lean_bin is not None else (shutil.which("lean") or str(Path.home() / ".elan" / "bin" / "lean"))
+    exporter = ROOT / "tools" / "lean_expr_export.lean"
+    sp_list = [s for s in search_paths if s]
+    sp_str = ":".join(sp_list)
+
+    with tempfile.TemporaryDirectory(prefix="infp_contract_") as td:
+        tmp_json = Path(td) / "decoded.dag.json"
+        tmp_json.write_bytes(canonical_dag_bytes(dag))
+        cmd = [lean_exe, "--run", str(exporter), "verify-contract", str(tmp_json), str(contract_path), base_modules]
+        if sp_str:
+            cmd.append(sp_str)
+        env = dict(os.environ)
+        env["LEAN_PATH"] = sp_str
+        res = subprocess.run(cmd, cwd=str(ROOT), env=env, capture_output=True, text=True, check=False)
+        if res.returncode != 0 or "CONTRACT PASS" not in res.stdout:
+            raise RuntimeError(f"Contract verification failed:\n{res.stdout}\n{res.stderr}")
+    return {"sha256": sha_hex, "output": res.stdout.strip()}
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="INFO .infp Proof-DAG binary container codec (v1 & v2)")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -994,6 +1096,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_bench.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
     p_bench.add_argument("--info-bin", type=Path, default=DEFAULT_INFO_BIN)
     p_bench.add_argument("--decomp-bin", type=Path, default=DEFAULT_DECOMP_BIN)
+
+    p_ver = sub.add_parser("verify-contract", help="Verify .infp v2 against isolated Challenge contract")
+    p_ver.add_argument("in_infp", type=Path)
+    p_ver.add_argument("contract_json", type=Path)
+    p_ver.add_argument("--base-modules", default="Init")
+    p_ver.add_argument("--lean-path", default="")
+    p_ver.add_argument("--challenge-source", type=Path, default=None)
+    p_ver.add_argument("--decomp-bin", type=Path, default=DEFAULT_DECOMP_BIN)
 
     args = parser.parse_args(argv)
     if args.cmd == "pack":
@@ -1025,6 +1135,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             metrics["verified_sha256"] = decoded_sha
             metrics["ratio_vs_json"] = round(len(raw_text) / metrics["infp_bytes"], 3)
             print(json.dumps(metrics, indent=2))
+        return 0
+    if args.cmd == "verify-contract":
+        sp = [s for s in args.lean_path.split(":") if s]
+        res = verify_infp_contract(
+            args.in_infp,
+            args.contract_json,
+            args.base_modules,
+            search_paths=sp,
+            challenge_source=args.challenge_source,
+            decomp_bin=args.decomp_bin,
+        )
+        print(json.dumps(res, indent=2))
         return 0
     return 1
 

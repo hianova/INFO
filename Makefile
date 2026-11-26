@@ -107,11 +107,11 @@ gate0-lean-theory: $(BUILD)/lean/Info/Theory.olean
 	@for m in Info.Coding Info.Induction Info.Bounds Info.Causal Info.ProofMDL Info.Theory; do \
 		LEAN_PATH=$(BUILD)/lean $(LEANCHECKER) $$m || exit 1; \
 	done
-	@python3 -c 'import pathlib, re; mods=[("Info.Coding","Info/Coding.lean"),("Info.Induction","Info/Induction.lean"),("Info.Bounds","Info/Bounds.lean"),("Info.Causal","Info/Causal.lean"),("Info.ProofMDL","Info/ProofMDL.lean")]; thms=[f"#print axioms {m}.{n}" for m,p in mods for n in re.findall(r"^theorem\s+(\S+)", pathlib.Path(p).read_text(encoding="utf-8"), re.M)]; assert len(thms)==94, f"Expected 94 theorems, got {len(thms)}"; pathlib.Path("$(BUILD)/info_axioms.in").write_text("import Info.Theory\n" + "\n".join(thms) + "\n", encoding="utf-8")'
+	@python3 -c 'import pathlib, re; mods=[("Info.Coding","Info/Coding.lean"),("Info.Induction","Info/Induction.lean"),("Info.Bounds","Info/Bounds.lean"),("Info.Causal","Info/Causal.lean"),("Info.ProofMDL","Info/ProofMDL.lean")]; thms=[f"#print axioms {m}.{n}" for m,p in mods for n in re.findall(r"^theorem\s+(\S+)", pathlib.Path(p).read_text(encoding="utf-8"), re.M)]; assert len(thms)==97, f"Expected 97 theorems, got {len(thms)}"; pathlib.Path("$(BUILD)/info_axioms.in").write_text("import Info.Theory\n" + "\n".join(thms) + "\n", encoding="utf-8")'
 	@LEAN_PATH=$(BUILD)/lean $(LEAN) --stdin < $(BUILD)/info_axioms.in > $(BUILD)/info_axioms.txt
 	@if grep -q 'sorryAx' $(BUILD)/info_axioms.txt; then echo "ERROR: sorryAx detected"; exit 1; fi
 	@if grep -q 'Lean\.ofReduceBool' $(BUILD)/info_axioms.txt; then echo "ERROR: Lean.ofReduceBool detected"; exit 1; fi
-	@echo "[Gate 0] PASS (Info.Theory 94 theorems, 0 sorryAx, 0 ofReduceBool)"
+	@echo "[Gate 0] PASS (Info.Theory 97 theorems, 0 sorryAx, 0 ofReduceBool)"
 
 gate1-lean-schema: $(BUILD)/info_schema_abi.h
 	@echo "[Gate 1] Auditing Info.lean pure schema config and generated ABI header..."

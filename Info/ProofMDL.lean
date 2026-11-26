@@ -412,4 +412,75 @@ theorem cognitive_transparency_mdl_bound
       (fairJointBits - summaryBits) < (predJointBits - summaryBits) := by
   omega
 
+/-- Joint source-and-kernel description length weighting both `L_source` and `L_kernel`. -/
+def dualLayerCost (wSrc wKer srcCost kerCost : Nat) : Nat :=
+  wSrc * srcCost + wKer * kerCost
+
+/-- 16. Dual-Layer Proof MDL Dominance: reducing `L_source` while holding `L_kernel` non-increasing
+        strictly improves joint MDL, whereas shrinking `L_source` by inflating `L_kernel` beyond
+        weighted savings reverses dominance (tactic-expansion trap). -/
+theorem dual_layer_mdl_dominance (wSrc wKer srcA kerA srcB kerB : Nat) :
+    (0 < wSrc → srcA < srcB → kerA ≤ kerB →
+      dualLayerCost wSrc wKer srcA kerA < dualLayerCost wSrc wKer srcB kerB) ∧
+      (srcA ≤ srcB → kerB ≤ kerA → wSrc * (srcB - srcA) < wKer * (kerA - kerB) →
+        dualLayerCost wSrc wKer srcB kerB < dualLayerCost wSrc wKer srcA kerA) := by
+  refine ⟨?_, ?_⟩
+  · intro hw hsrc hker
+    unfold dualLayerCost
+    have h1 : wSrc * srcA < wSrc * srcB := Nat.mul_lt_mul_of_pos_left hsrc hw
+    have h2 : wKer * kerA ≤ wKer * kerB := Nat.mul_le_mul_left wKer hker
+    omega
+  · intro hsrc hker htrade
+    unfold dualLayerCost
+    have hS : wSrc * (srcB - srcA) + wSrc * srcA = wSrc * srcB := by
+      rw [← Nat.mul_add, Nat.sub_add_cancel hsrc]
+    have hK : wKer * (kerA - kerB) + wKer * kerB = wKer * kerA := by
+      rw [← Nat.mul_add, Nat.sub_add_cancel hker]
+    omega
+
+/-- Cost-annotated structure/interface field record for Dead-Field pruning analysis. -/
+structure FieldCost where
+  fieldId : Nat
+  cost : Nat
+  projected : Bool
+  deriving Repr, DecidableEq, Inhabited
+
+def totalInterfaceCost (fs : List FieldCost) : Nat :=
+  (fs.map FieldCost.cost).sum
+
+def pruneUnusedFields (fs : List FieldCost) : List FieldCost :=
+  fs.filter FieldCost.projected
+
+def deadFieldCost (fs : List FieldCost) : Nat :=
+  ((fs.filter (fun f => !f.projected)).map FieldCost.cost).sum
+
+private theorem field_live_plus_dead_eq (fs : List FieldCost) :
+    totalInterfaceCost (pruneUnusedFields fs) + deadFieldCost fs = totalInterfaceCost fs := by
+  induction fs with
+  | nil => simp [totalInterfaceCost, pruneUnusedFields, deadFieldCost]
+  | cons f tl ih =>
+    cases h : f.projected <;>
+      simp [totalInterfaceCost, pruneUnusedFields, deadFieldCost, h] at ih ⊢ <;>
+      omega
+
+/-- 17. Minimal-Sufficient Interface Field Pruning: eliminating unprojected structure fields
+        monotonically reduces interface cost, strictly drops it whenever dead fields exist, and
+        preserves every projected field. -/
+theorem interface_field_pruning_cost_le (fs : List FieldCost) :
+    totalInterfaceCost (pruneUnusedFields fs) ≤ totalInterfaceCost fs ∧
+      (0 < deadFieldCost fs → totalInterfaceCost (pruneUnusedFields fs) < totalInterfaceCost fs) ∧
+      (∀ f ∈ fs, f.projected = true → f ∈ pruneUnusedFields fs) := by
+  have h := field_live_plus_dead_eq fs
+  refine ⟨by omega, fun hpos => by omega, ?_⟩
+  intro f hf hproj
+  simp [pruneUnusedFields, hf, hproj]
+
+/-- 18. Trusted Statement TCB Isolation: if a top-level theorem signature depends solely on trusted
+        declarations disjoint from elaboration-tuning definitions, no tuning attribute pollutes the TCB. -/
+theorem tcb_statement_isolation_sound (deps : List Nat) (isTrusted isTuning : Nat → Bool)
+    (hIsolated : ∀ d ∈ deps, isTrusted d = true)
+    (hDisjoint : ∀ d, isTrusted d = true → isTuning d = false) :
+    ∀ d ∈ deps, isTuning d = false :=
+  fun d hd => hDisjoint d (hIsolated d hd)
+
 end Info.ProofMDL

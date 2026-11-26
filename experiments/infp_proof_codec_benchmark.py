@@ -47,6 +47,7 @@ from info_proof_codec import (  # type: ignore  # noqa: E402
     canonical_dag_sha256,
     pack_dag_to_infp,
     unpack_infp_to_dag,
+    verify_infp_contract,
 )
 
 
@@ -244,10 +245,25 @@ def run_part1_infp_codec_benchmark() -> None:
 
             zstd_str = f"{zstd_bytes:>7}" if zstd_bytes is not None else "    n/a"
             ratio_v2 = len(raw_bytes) / m2["infp_bytes"]
+            src_paths: List[Path] = []
+            if mod == "Info.Theory":
+                src_paths = sorted((ROOT / "Info").glob("*.lean"))
+            elif mod == "Flow.Math":
+                src_paths = sorted((ROOT.parent / "FLOW" / "core" / "lean" / "Flow").glob("*.lean")) + sorted(
+                    (ROOT.parent / "FLOW" / "sdk" / "lean" / "Flow").glob("*.lean")
+                )
+            src_info = ""
+            if src_paths:
+                sc = tdir / f"{mod}.src_concat.lean"
+                sc.write_bytes(b"\n".join(p.read_bytes() for p in src_paths if p.is_file()))
+                ev_s = run_eval_bpb(sc, tdir / f"{mod}.src_bpb.json")
+                l_src_b = float(ev_s["total_bits_q12"]) / (4096.0 * 8.0)
+                src_info = f" L_src={l_src_b:>5.0f}B k/s={m2['infp_bytes'] / max(1.0, l_src_b):.2f}x"
+            bloat_x = olean_bytes / max(1, m2["infp_bytes"])
             print(
-                f"    {mod:<13} | olean={olean_bytes:>9}B | json={len(raw_bytes):>7}B | "
+                f"    {mod:<13} | olean={olean_bytes:>9}B ({bloat_x:>5.1f}x) | json={len(raw_bytes):>7}B | "
                 f"lzma9={lzma_bytes:>6}B zstd19={zstd_str}B | v1={m1['infp_bytes']:>6}B -> "
-                f"v2={m2['infp_bytes']:>6}B ({ratio_v2:>5.2f}x, macros={m2['hot_macro_count']:>4}) | SHA256=EXACT"
+                f"v2={m2['infp_bytes']:>6}B ({ratio_v2:>5.2f}x, macros={m2['hot_macro_count']:>4}){src_info} | SHA256=EXACT"
             )
             audited += 1
 
@@ -343,6 +359,82 @@ def run_part2_kernel_retypecheck_roundtrip() -> None:
             f"    Info.ProofMDL | json={raw_p.stat().st_size:>6}B -> .infp v2={m_p['infp_bytes']:>5}B | "
             f"{r_ver_p.stdout.strip()}"
         )
+
+        # Case C: Comparator-style isolated Challenge contract replay + tamper/pollution rejection
+        chal_dir = tdir / "challenge_lean"
+        chal_dir.mkdir(parents=True, exist_ok=True)
+        chal_src = chal_dir / "ChallengeCausal.lean"
+        chal_src.write_text(
+            "namespace Info.Causal\n"
+            "theorem causal_mdl_true_direction_shorter\n"
+            "    (lenX1 lenX2 lenYgivenX lenY1 lenY2 lenXgivenY1 lenXgivenY2 dataX1Y1 dataX2Y2 : Nat)\n"
+            "    (hCauseMarg : lenX1 + lenX2 ≤ lenY1 + lenY2)\n"
+            "    (hMechSimpler : lenYgivenX < lenXgivenY1 + lenXgivenY2) :\n"
+            "    (lenX1 + lenX2 + lenYgivenX + dataX1Y1 + dataX2Y2) <\n"
+            "      (lenY1 + lenY2 + lenXgivenY1 + lenXgivenY2 + dataX1Y1 + dataX2Y2) := by\n"
+            "  sorry\n"
+            "end Info.Causal\n",
+            encoding="utf-8",
+        )
+        c_ok = subprocess.run(
+            [str(lean_bin), f"--root={chal_dir}", "-o", str(chal_dir / "ChallengeCausal.olean"), str(chal_src)],
+            capture_output=True, text=True, check=False,
+        )
+        assert c_ok.returncode == 0, c_ok.stderr
+        contract_ok = tdir / "contract_ok.json"
+        contract_ok.write_text(
+            json.dumps({
+                "challenge_module": "ChallengeCausal",
+                "theorem_names": ["Info.Causal.causal_mdl_true_direction_shorter"],
+                "permitted_axioms": ["propext", "Quot.sound", "Classical.choice"],
+                "forbidden_imports": ["Speed"],
+            }),
+            encoding="utf-8",
+        )
+        res_ok = verify_infp_contract(
+            infp_c, contract_ok, "Init", [str(chal_dir)], challenge_source=chal_src, decomp_bin=DECOMP_BIN, lean_bin=lean_bin
+        )
+        assert "CONTRACT PASS" in res_ok["output"], res_ok
+        print(f"    {res_ok['output']}")
+
+        # Negative Test 1: Type signature tamper (< -> ≤) must be rejected
+        bad_src = chal_dir / "ChallengeBad.lean"
+        bad_src.write_text(chal_src.read_text(encoding="utf-8").replace(") <\n", ") ≤\n"), encoding="utf-8")
+        c_bad = subprocess.run(
+            [str(lean_bin), f"--root={chal_dir}", "-o", str(chal_dir / "ChallengeBad.olean"), str(bad_src)],
+            capture_output=True, text=True, check=False,
+        )
+        assert c_bad.returncode == 0, c_bad.stderr
+        contract_bad = tdir / "contract_bad.json"
+        contract_bad.write_text(
+            json.dumps({
+                "challenge_module": "ChallengeBad",
+                "theorem_names": ["Info.Causal.causal_mdl_true_direction_shorter"],
+                "permitted_axioms": ["propext", "Quot.sound", "Classical.choice"],
+            }),
+            encoding="utf-8",
+        )
+        rejected_type = False
+        try:
+            verify_infp_contract(
+                infp_c, contract_bad, "Init", [str(chal_dir)], challenge_source=bad_src, decomp_bin=DECOMP_BIN, lean_bin=lean_bin
+            )
+        except RuntimeError:
+            rejected_type = True
+        assert rejected_type, "Contract tamper (< -> ≤) was unexpectedly accepted!"
+
+        # Negative Test 2: TCB attribute pollution (`attribute [simp]`) must be rejected
+        polluted_src = chal_dir / "ChallengePolluted.lean"
+        polluted_src.write_text("attribute [simp] Nat.add_zero\n" + chal_src.read_text(encoding="utf-8"), encoding="utf-8")
+        rejected_tcb = False
+        try:
+            verify_infp_contract(
+                infp_c, contract_ok, "Init", [str(chal_dir)], challenge_source=polluted_src, decomp_bin=DECOMP_BIN, lean_bin=lean_bin
+            )
+        except ValueError:
+            rejected_tcb = True
+        assert rejected_tcb, "Polluted Challenge TCB was unexpectedly accepted!"
+        print("    [Contract TCB] Isolated Challenge match PASS | Type tamper REJECTED | TCB pollution REJECTED")
 
 
 def run_eval_bpb(path: Path, out_json: Path) -> Dict[str, Any]:
