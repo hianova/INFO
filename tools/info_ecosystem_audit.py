@@ -32,7 +32,26 @@ EXT_TO_LANG = {
     ".lean": "lean",
     ".py": "py",
 }
-SKIP_DIRS = {"build", ".git", "assets", "data", "__pycache__", ".elan", "node_modules"}
+SKIP_DIRS = {
+    "build",
+    ".git",
+    "assets",
+    "data",
+    "__pycache__",
+    ".elan",
+    "node_modules",
+    "target",
+    ".lake",
+    "vendor",
+    "kaggle",
+    "patch",
+    "refs",
+    "research",
+    "venv",
+    ".venv",
+    "dfthcsos_opt",
+    "submissions",
+}
 MIN_FILE_BYTES = 256
 MAX_FILE_BYTES = 512 * 1024
 
