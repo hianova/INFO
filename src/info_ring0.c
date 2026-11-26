@@ -1912,10 +1912,12 @@ int64_t info_krawtchouk_int(uint32_t n, uint32_t k, uint32_t x) {
             binom[i][j] = (j == i) ? 1 : (binom[i - 1U][j - 1U] + binom[i - 1U][j]);
         }
     }
+    uint64_t nx = (uint64_t)n - (uint64_t)x;
     int64_t sum = 0;
     for (uint32_t j = 0U; j <= k; j++) {
-        if (j <= x && (k - j) <= (n - x)) {
-            int64_t term = binom[x][j] * binom[n - x][k - j];
+        uint64_t kj = (uint64_t)k - (uint64_t)j;
+        if (j <= x && kj <= nx) {
+            int64_t term = binom[x][j] * binom[nx][kj];
             if ((j & 1U) != 0U) {
                 sum -= term;
             } else {

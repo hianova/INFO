@@ -1,0 +1,27 @@
+# FLOW v10.0.0 ArenaSchema: 64-byte INFO Codec & Delsarte Wire Cells
+arena 4 info_wire build/info_wire.h info_wire_cell_t info_wire_map_t info_wire_arena_t
+
+layout codec_stats info_codec_stats_wire_t
+  field orig_bits 0 u64 1
+  field compressed_bits 64 u64 1
+  field alg_hits 128 u64 1
+  field match_hits 192 u64 1
+  field max_surprise_q12 256 u64 1
+  field spike_offset 320 u64 1
+  field bpb_q12 384 u64 1
+  field roundtrip_ok 448 u64 1
+
+layout delsarte_meta info_delsarte_wire_t
+  field n 0 u32 1
+  field d 32 u32 1
+  field searu_code_size 64 u64 1
+  field singleton_ub 128 u64 1
+  field hamming_ub 192 u64 1
+  field delsarte_ub_num 256 u64 1
+  field delsarte_ub_den 320 u64 1
+  field dual_verified 384 u32 1
+  field tight 416 u32 1
+  field merkle 448 u64 1
+
+region stats 0 2 codec_stats INFO_SLOT_STATS -
+region delsarte 2 2 delsarte_meta INFO_SLOT_DELSARTE -
