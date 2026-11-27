@@ -144,7 +144,7 @@ endif
 	@echo "[Gate 2] PASS (0 undef symbols, Pure-GPR clean, C++20 clean, clang-tidy 0 warnings)"
 
 gate3-selftest: $(BUILD)/info
-	@echo "[Gate 3] Running built-in 18-suite Ring-0 + cert selftest..."
+	@echo "[Gate 3] Running built-in 19-suite Ring-0 + cert selftest..."
 	./$(BUILD)/info selftest
 	@echo "[Gate 3] PASS"
 
@@ -168,7 +168,7 @@ gate5-oracle: gate0-lean-theory gate1-lean-schema gate4-cli-audit
 	@echo "[Gate 5] PASS"
 
 gate6-sabotage: gate1-lean-schema
-	@echo "[Gate 6] Running 42-mutant single-fault sabotage gate..."
+	@echo "[Gate 6] Running 45-mutant single-fault sabotage gate..."
 	python3 tools/info_sabotage_check.py
 	@echo "[Gate 6] PASS"
 
@@ -191,7 +191,7 @@ experiments: $(BUILD)/info $(BUILD)/info_decomp $(BUILD)/lean/Info/Theory.olean
 verify-all: gate0-lean-theory gate1-lean-schema gate2-ring0-audit gate3-selftest \
 	gate4-cli-audit gate5-oracle gate6-sabotage gate7-format
 	@echo "================================================================"
-	@echo "INFO v1.0.0 — ALL 8 VERIFICATION GATES PASSED"
+	@echo "INFO v1.2.0 — ALL 8 VERIFICATION GATES PASSED"
 	@echo "================================================================"
 
 verify: verify-all

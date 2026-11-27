@@ -12,7 +12,7 @@ on:
 
 jobs:
   verify-info:
-    name: INFO v1.0.0 Pure-Theory, Ring-0 Hutter Codec & Causal MDL (${{ matrix.os }})
+    name: INFO v1.2.0 Pure-Theory, Ring-0 Hutter Codec & Causal MDL (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -57,7 +57,7 @@ jobs:
           fi
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
 
-      - name: Build FLOW & Run INFO v1.0.0 8-Gate + Experiment Suite
+      - name: Build FLOW & Run INFO v1.2.0 8-Gate + Experiment Suite
         run: |
           export PATH="$HOME/.elan/bin:$PATH"
           if [ "$(uname -s)" = "Darwin" ]; then

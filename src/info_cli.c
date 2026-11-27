@@ -7,6 +7,8 @@
 #define INFO_CLI_MAX_BYTES (4U * 1024U * 1024U)
 
 static info_codec_ws_t g_ws;
+static info_hutter_ws_t g_hutter_ws;
+static info_hutter_state_t g_hutter_st;
 static info_cert_ws_t g_cert_ws;
 static info_alpha_ws_t g_alpha_ws;
 static uint8_t g_buf_a[INFO_CLI_MAX_BYTES + 1024U];
@@ -512,15 +514,111 @@ static uint32_t test_t18_lean_expr_alpha(void) {
     return fails;
 }
 
+static uint32_t test_t19_inf2_streaming(void) {
+    uint32_t fails = UINT32_C(0);
+    /* First verify 8-byte match beats 4-byte decoy collisions + ICM state transition + mixer_b */
+    static const char k_setup[] = "SIG8AAAA_TAIL SIG8QQ IG8AQQ G8AAQQ 8AAAQQ AAAAQQ ";
+    static const char k_probe[] = "SIG8AAAA_";
+    size_t slen = strlen(k_setup);
+    size_t qlen = strlen(k_probe);
+
+    info_hutter_stream_begin(&g_hutter_ws, &g_hutter_st, INFO_CODEC_FLAG_ALG);
+    size_t p1_cl = info_hutter_encode_block(&g_hutter_ws, &g_hutter_st, (const uint8_t *)k_setup,
+                                            slen, g_buf_b, sizeof(g_buf_b));
+    size_t p2_cl = info_hutter_encode_block(&g_hutter_ws, &g_hutter_st, (const uint8_t *)k_probe,
+                                            qlen, g_buf_b + p1_cl, sizeof(g_buf_b) - p1_cl);
+    if (p1_cl == 0U || p2_cl == 0U || g_hutter_st.match_len < 8U) {
+        fails++;
+    }
+
+    static const char k_phrase[] =
+        "Hutter Prize continuous INF2 streaming context-mixing: dual mixers, 2-stage APM, "
+        "ICM finite-state probability table, 8-byte long-range match & online law induction.\n";
+    static const size_t blk_lens[4] = {2048U, 1777U, 3001U, 1366U};
+    const size_t total_len = 8192U;
+    size_t pos = 0U;
+    size_t plen = strlen(k_phrase);
+    while (pos < 6144U) {
+        size_t chunk = (6144U - pos < plen) ? (6144U - pos) : plen;
+        memcpy(g_buf_a + pos, k_phrase, chunk);
+        pos += chunk;
+    }
+    info_gen_lfsr23_stream(UINT32_C(0x5ACE1), g_buf_a + 6144U, 2048U);
+
+    info_hutter_stream_begin(&g_hutter_ws, &g_hutter_st, INFO_CODEC_FLAG_ALG);
+    size_t cmp_lens[4] = {0U, 0U, 0U, 0U};
+    size_t raw_off = 0U;
+    size_t cmp_off = 0U;
+    for (uint32_t b = 0U; b < 4U; b++) {
+        size_t cl =
+            info_hutter_encode_block(&g_hutter_ws, &g_hutter_st, g_buf_a + raw_off, blk_lens[b],
+                                     g_buf_b + cmp_off, sizeof(g_buf_b) - cmp_off);
+        if (cl == 0U) {
+            fails++;
+            return fails;
+        }
+        cmp_lens[b] = cl;
+        raw_off += blk_lens[b];
+        cmp_off += cl;
+    }
+    uint64_t fnv_enc = info_hutter_stream_fnv64(&g_hutter_st);
+    uint32_t icm_nz = 0U;
+    for (uint32_t i = 0U; i < INFO_HWS_ICM_SIZE; i++) {
+        if (g_hutter_ws.icm_ctx[i] != 0U) {
+            icm_nz = 1U;
+            break;
+        }
+    }
+    /* Verify mix_b nonzero training & tight cmp budget */
+    int32_t mb_diff = 0;
+    for (uint32_t c = 0U; c < INFO_HWS_MIX_CTX; c++) {
+        if (g_hutter_ws.mix_b[c][0] != 192 || g_hutter_ws.mix_b[c][1] != 384) {
+            mb_diff = 1;
+            break;
+        }
+    }
+    if (g_hutter_st.total_bytes != (uint64_t)total_len || g_hutter_st.match_hits == 0U ||
+        g_hutter_st.alg_hits == 0U || icm_nz == 0U || mb_diff == 0 || cmp_off >= 420U) {
+        fails++;
+    }
+
+    info_hutter_stream_begin(&g_hutter_ws, &g_hutter_st, INFO_CODEC_FLAG_ALG);
+    raw_off = 0U;
+    cmp_off = 0U;
+    for (uint32_t b = 0U; b < 4U; b++) {
+        size_t dl = info_hutter_decode_block(&g_hutter_ws, &g_hutter_st, g_buf_b + cmp_off,
+                                             cmp_lens[b], g_buf_c + raw_off, blk_lens[b]);
+        if (dl != blk_lens[b]) {
+            fails++;
+        }
+        raw_off += blk_lens[b];
+        cmp_off += cmp_lens[b];
+    }
+    if (info_hutter_stream_fnv64(&g_hutter_st) != fnv_enc ||
+        !info_mem_eq(g_buf_a, g_buf_c, total_len)) {
+        fails++;
+    }
+
+    uint8_t hdr[INFO_INF2_HEADER_BYTES];
+    uint32_t p_flags = 0U;
+    uint64_t p_orig = 0U;
+    info_inf2_write_header(hdr, INFO_CODEC_FLAG_ALG, (uint64_t)total_len);
+    if (!info_inf2_parse_header(hdr, &p_flags, &p_orig) || p_flags != INFO_CODEC_FLAG_ALG ||
+        p_orig != (uint64_t)total_len) {
+        fails++;
+    }
+    return fails;
+}
+
 static int info_cmd_selftest(void) {
     uint32_t f_prim = test_t1_t4_primitives();
     uint32_t f_codec = test_t5_t7_codec_roundtrip();
     uint32_t f_sep = test_t8_t10_separation();
     uint32_t f_thy = test_t11_t16_theory_and_certs();
-    uint32_t f_mdl = test_t17_alpha_mdl() + test_t18_lean_expr_alpha();
+    uint32_t f_mdl = test_t17_alpha_mdl() + test_t18_lean_expr_alpha() + test_t19_inf2_streaming();
     uint32_t total = f_prim + f_codec + f_sep + f_thy + f_mdl;
     printf("[selftest] T1..T4(prim)=%s T5..T7(codec)=%s T8..T10(alg_sep)=%s "
-           "T11..T18(ctw/delsarte/causal/fir/alpha_mdl/lean_expr)=%s | fails=%u\n",
+           "T11..T19(ctw/delsarte/causal/fir/alpha_mdl/lean_expr/inf2)=%s | fails=%u\n",
            f_prim == 0U ? "PASS" : "FAIL", f_codec == 0U ? "PASS" : "FAIL",
            f_sep == 0U ? "PASS" : "FAIL", (f_thy + f_mdl) == 0U ? "PASS" : "FAIL", (unsigned)total);
     return (total == 0U) ? 0 : 1;
@@ -530,36 +628,232 @@ static int info_cmd_selftest(void) {
  * CLI Commands
  * ============================================================================ */
 
+static uint32_t cli_get_u32_le(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8U) | ((uint32_t)p[2] << 16U) |
+           ((uint32_t)p[3] << 24U);
+}
+
 static int info_cmd_compress(int argc, char **argv) {
     const char *in_p = argv[2];
     const char *out_p = argv[3];
     uint32_t flags = info_has_flag(argc, argv, 4, "--no-alg") ? UINT32_C(0) : INFO_CODEC_FLAG_ALG;
-    size_t len = 0U;
-    if (!info_read_file(in_p, g_buf_a, INFO_CLI_MAX_BYTES, &len)) {
-        (void)fprintf(stderr, "ERROR: cannot read %s (or exceeds 4MB)\n", in_p);
+    bool force_stream = info_has_flag(argc, argv, 4, "--stream");
+
+    FILE *fi = fopen(in_p, "rb");
+    if (fi == NULL) {
+        (void)fprintf(stderr, "ERROR: cannot open %s\n", in_p);
         return 1;
     }
-    size_t cmp_len = info_compress(&g_ws, g_buf_a, len, g_buf_b, sizeof(g_buf_b), flags);
-    if (cmp_len == 0U || !info_write_file(out_p, g_buf_b, cmp_len)) {
-        (void)fprintf(stderr, "ERROR: compress/write failed\n");
+    if (fseek(fi, 0L, SEEK_END) != 0) {
+        (void)fclose(fi);
+        (void)fprintf(stderr, "ERROR: cannot seek %s\n", in_p);
         return 1;
     }
-    printf("[compress] in=%zuB out=%zuB flags=%u\n", len, cmp_len, (unsigned)flags);
+    long fsz_l = ftell(fi);
+    if (fsz_l < 0L || fseek(fi, 0L, SEEK_SET) != 0) {
+        (void)fclose(fi);
+        (void)fprintf(stderr, "ERROR: cannot determine size of %s\n", in_p);
+        return 1;
+    }
+    uint64_t fsz = (uint64_t)fsz_l;
+
+    if (!force_stream && fsz <= (uint64_t)INFO_CLI_MAX_BYTES) {
+        size_t len = (fsz > 0U) ? fread(g_buf_a, 1U, (size_t)fsz, fi) : 0U;
+        int extra = fgetc(fi);
+        (void)fclose(fi);
+        if (len != (size_t)fsz || extra != EOF) {
+            (void)fprintf(stderr, "ERROR: cannot read %s cleanly\n", in_p);
+            return 1;
+        }
+        size_t cmp_len = info_compress(&g_ws, g_buf_a, len, g_buf_b, sizeof(g_buf_b), flags);
+        if (cmp_len == 0U || !info_write_file(out_p, g_buf_b, cmp_len)) {
+            (void)fprintf(stderr, "ERROR: compress/write failed\n");
+            return 1;
+        }
+        printf("[compress] in=%zuB out=%zuB flags=%u\n", len, cmp_len, (unsigned)flags);
+        return 0;
+    }
+
+    FILE *fo = fopen(out_p, "wb");
+    if (fo == NULL) {
+        (void)fclose(fi);
+        (void)fprintf(stderr, "ERROR: cannot write %s\n", out_p);
+        return 1;
+    }
+    uint8_t hdr[INFO_INF2_HEADER_BYTES];
+    info_inf2_write_header(hdr, flags, fsz);
+    if (fwrite(hdr, 1U, INFO_INF2_HEADER_BYTES, fo) != (size_t)INFO_INF2_HEADER_BYTES) {
+        (void)fclose(fi);
+        (void)fclose(fo);
+        return 1;
+    }
+
+    info_hutter_stream_begin(&g_hutter_ws, &g_hutter_st, flags);
+    uint64_t total_in = UINT64_C(0);
+    uint64_t total_out = (uint64_t)INFO_INF2_HEADER_BYTES;
+    uint32_t blocks = UINT32_C(0);
+    while (total_in < fsz) {
+        uint64_t rem = fsz - total_in;
+        size_t want =
+            (rem > (uint64_t)INFO_INF2_BLOCK_MAX) ? (size_t)INFO_INF2_BLOCK_MAX : (size_t)rem;
+        size_t got = fread(g_buf_a, 1U, want, fi);
+        if (got != want) {
+            (void)fclose(fi);
+            (void)fclose(fo);
+            (void)fprintf(stderr, "ERROR: short read on %s\n", in_p);
+            return 1;
+        }
+        size_t cl = info_hutter_encode_block(&g_hutter_ws, &g_hutter_st, g_buf_a, got, g_buf_b,
+                                             sizeof(g_buf_b));
+        if (cl == 0U) {
+            (void)fclose(fi);
+            (void)fclose(fo);
+            (void)fprintf(stderr, "ERROR: INF2 encode block overflow\n");
+            return 1;
+        }
+        uint8_t bhdr[INFO_INF2_BLOCK_HDR];
+        info_inf2_write_block_hdr(bhdr, (uint32_t)got, (uint32_t)cl);
+        if (fwrite(bhdr, 1U, INFO_INF2_BLOCK_HDR, fo) != (size_t)INFO_INF2_BLOCK_HDR ||
+            fwrite(g_buf_b, 1U, cl, fo) != cl) {
+            (void)fclose(fi);
+            (void)fclose(fo);
+            return 1;
+        }
+        total_in += (uint64_t)got;
+        total_out += (uint64_t)INFO_INF2_BLOCK_HDR + (uint64_t)cl;
+        blocks++;
+    }
+
+    uint8_t tr[INFO_INF2_TRAILER_BYTES];
+    info_put_u64_le_pub(tr, info_hutter_stream_fnv64(&g_hutter_st));
+    if (fwrite(tr, 1U, INFO_INF2_TRAILER_BYTES, fo) != (size_t)INFO_INF2_TRAILER_BYTES) {
+        (void)fclose(fi);
+        (void)fclose(fo);
+        return 1;
+    }
+    total_out += (uint64_t)INFO_INF2_TRAILER_BYTES;
+    (void)fclose(fi);
+    if (fclose(fo) != 0) {
+        return 1;
+    }
+    printf("[compress-inf2] in=%lluB out=%lluB blocks=%u flags=%u\n", (unsigned long long)total_in,
+           (unsigned long long)total_out, (unsigned)blocks, (unsigned)flags);
     return 0;
 }
 
 static int info_cmd_decompress(const char *in_p, const char *out_p) {
-    size_t len = 0U;
-    if (!info_read_file(in_p, g_buf_a, sizeof(g_buf_a), &len)) {
-        (void)fprintf(stderr, "ERROR: cannot read %s\n", in_p);
+    FILE *fi = fopen(in_p, "rb");
+    if (fi == NULL) {
+        (void)fprintf(stderr, "ERROR: cannot open %s\n", in_p);
         return 1;
     }
-    size_t dec_len = info_decompress(&g_ws, g_buf_a, len, g_buf_b, INFO_CLI_MAX_BYTES);
-    if (dec_len == SIZE_MAX || !info_write_file(out_p, g_buf_b, dec_len)) {
-        (void)fprintf(stderr, "ERROR: decompress failed\n");
+    uint8_t magic_hdr[4];
+    if (fread(magic_hdr, 1U, 4U, fi) != 4U) {
+        (void)fclose(fi);
+        (void)fprintf(stderr, "ERROR: empty or invalid compressed file %s\n", in_p);
         return 1;
     }
-    printf("[decompress] in=%zuB out=%zuB\n", len, dec_len);
+    uint32_t magic = cli_get_u32_le(magic_hdr);
+    if (magic == INFO_INF1_MAGIC) {
+        g_buf_a[0] = magic_hdr[0];
+        g_buf_a[1] = magic_hdr[1];
+        g_buf_a[2] = magic_hdr[2];
+        g_buf_a[3] = magic_hdr[3];
+        size_t rest = fread(g_buf_a + 4U, 1U, sizeof(g_buf_a) - 4U, fi);
+        int extra = fgetc(fi);
+        (void)fclose(fi);
+        size_t len = 4U + rest;
+        if (extra != EOF || len < INFO_INF1_HEADER_BYTES) {
+            (void)fprintf(stderr, "ERROR: cannot read %s\n", in_p);
+            return 1;
+        }
+        size_t dec_len = info_decompress(&g_ws, g_buf_a, len, g_buf_b, INFO_CLI_MAX_BYTES);
+        if (dec_len == SIZE_MAX || !info_write_file(out_p, g_buf_b, dec_len)) {
+            (void)fprintf(stderr, "ERROR: decompress failed\n");
+            return 1;
+        }
+        printf("[decompress] in=%zuB out=%zuB\n", len, dec_len);
+        return 0;
+    }
+    if (magic != INFO_INF2_MAGIC) {
+        (void)fclose(fi);
+        (void)fprintf(stderr, "ERROR: unknown magic in %s\n", in_p);
+        return 1;
+    }
+
+    uint8_t hdr[INFO_INF2_HEADER_BYTES];
+    hdr[0] = magic_hdr[0];
+    hdr[1] = magic_hdr[1];
+    hdr[2] = magic_hdr[2];
+    hdr[3] = magic_hdr[3];
+    if (fread(hdr + 4U, 1U, INFO_INF2_HEADER_BYTES - 4U, fi) !=
+        (size_t)(INFO_INF2_HEADER_BYTES - 4U)) {
+        (void)fclose(fi);
+        (void)fprintf(stderr, "ERROR: truncated INF2 header\n");
+        return 1;
+    }
+    uint32_t flags = UINT32_C(0);
+    uint64_t orig_bytes = UINT64_C(0);
+    if (!info_inf2_parse_header(hdr, &flags, &orig_bytes)) {
+        (void)fclose(fi);
+        return 1;
+    }
+    FILE *fo = fopen(out_p, "wb");
+    if (fo == NULL) {
+        (void)fclose(fi);
+        (void)fprintf(stderr, "ERROR: cannot write %s\n", out_p);
+        return 1;
+    }
+    info_hutter_stream_begin(&g_hutter_ws, &g_hutter_st, flags);
+    uint64_t decoded = UINT64_C(0);
+    uint64_t total_in = (uint64_t)INFO_INF2_HEADER_BYTES;
+    while (decoded < orig_bytes) {
+        uint8_t bhdr[INFO_INF2_BLOCK_HDR];
+        if (fread(bhdr, 1U, INFO_INF2_BLOCK_HDR, fi) != (size_t)INFO_INF2_BLOCK_HDR) {
+            (void)fclose(fi);
+            (void)fclose(fo);
+            return 1;
+        }
+        uint32_t raw_len = UINT32_C(0);
+        uint32_t cmp_len = UINT32_C(0);
+        info_inf2_parse_block_hdr(bhdr, &raw_len, &cmp_len);
+        if (raw_len == 0U || raw_len > INFO_INF2_BLOCK_MAX ||
+            (uint64_t)raw_len > (orig_bytes - decoded) || cmp_len == 0U ||
+            (size_t)cmp_len > sizeof(g_buf_a)) {
+            (void)fclose(fi);
+            (void)fclose(fo);
+            return 1;
+        }
+        if (fread(g_buf_a, 1U, (size_t)cmp_len, fi) != (size_t)cmp_len) {
+            (void)fclose(fi);
+            (void)fclose(fo);
+            return 1;
+        }
+        if (info_hutter_decode_block(&g_hutter_ws, &g_hutter_st, g_buf_a, (size_t)cmp_len, g_buf_b,
+                                     (size_t)raw_len) != (size_t)raw_len ||
+            fwrite(g_buf_b, 1U, (size_t)raw_len, fo) != (size_t)raw_len) {
+            (void)fclose(fi);
+            (void)fclose(fo);
+            return 1;
+        }
+        decoded += (uint64_t)raw_len;
+        total_in += (uint64_t)INFO_INF2_BLOCK_HDR + (uint64_t)cmp_len;
+    }
+    uint8_t tr[INFO_INF2_TRAILER_BYTES];
+    if (fread(tr, 1U, INFO_INF2_TRAILER_BYTES, fi) != (size_t)INFO_INF2_TRAILER_BYTES ||
+        info_get_u64_le_pub(tr) != info_hutter_stream_fnv64(&g_hutter_st) || fgetc(fi) != EOF) {
+        (void)fclose(fi);
+        (void)fclose(fo);
+        (void)fprintf(stderr, "ERROR: INF2 checksum or trailer mismatch\n");
+        return 1;
+    }
+    total_in += (uint64_t)INFO_INF2_TRAILER_BYTES;
+    (void)fclose(fi);
+    if (fclose(fo) != 0) {
+        return 1;
+    }
+    printf("[decompress-inf2] in=%lluB out=%lluB\n", (unsigned long long)total_in,
+           (unsigned long long)decoded);
     return 0;
 }
 

@@ -175,7 +175,25 @@ def verify_decomp_roundtrip() -> None:
             got_hash = hashlib.sha256(dec_p.read_bytes()).hexdigest()
             exp_hash = hashlib.sha256(data).hexdigest()
             assert got_hash == exp_hash, f"SHA-256 mismatch on {name}"
-    print(f"  [Oracle-Decomp] {len(payloads)}/{len(payloads)} SHA-256 bit-exact via standalone info_decomp ({DECOMP_BIN.stat().st_size}B) PASS")
+
+        # Also verify INF2 multi-block continuous streaming codec via standalone info_decomp
+        stream_data = (
+            b"Hutter Prize continuous INF2 Oracle Payload. " * 25000
+            + py_gen_lfsr23(0x5ACE1, 20480)
+        )
+        s_raw = tdir / "stream_inf2.bin"
+        s_inf = tdir / "stream_inf2.inf2"
+        s_dec = tdir / "stream_inf2.dec"
+        s_raw.write_bytes(stream_data)
+        rs1 = run_cmd([str(INFO_BIN), "compress", str(s_raw), str(s_inf), "--stream"])
+        assert rs1.returncode == 0, rs1.stderr
+        assert s_inf.read_bytes()[:4] == b"INF2", "Expected INF2 magic header"
+        rs2 = run_cmd([str(DECOMP_BIN), str(s_inf), str(s_dec)])
+        assert rs2.returncode == 0, rs2.stderr
+        assert hashlib.sha256(s_dec.read_bytes()).hexdigest() == hashlib.sha256(stream_data).hexdigest(), (
+            "SHA-256 mismatch on INF2 stream"
+        )
+    print(f"  [Oracle-Decomp] {len(payloads) + 1}/{len(payloads) + 1} SHA-256 bit-exact via standalone info_decomp ({DECOMP_BIN.stat().st_size}B, incl. INF2 stream) PASS")
 
 
 def verify_classifiers() -> None:

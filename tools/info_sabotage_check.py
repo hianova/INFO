@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-tools/info_sabotage_check.py — 42-Mutant Single-Fault Sabotage Gate (Gate 6)
+tools/info_sabotage_check.py — 45-Mutant Single-Fault Sabotage Gate (Gate 6)
 ===============================================================================
-Verifies 100.0% mutation-kill efficacy (42/42 killed, 0 compile errors) across
-14 categories (3 mutants each) in `src/info_ring0.c`:
+Verifies 100.0% mutation-kill efficacy (45/45 killed, 0 compile errors) across
+15 categories (3 mutants each) in `src/info_ring0.c`:
    1. arith_coder          (3)
    2. stretch_squash       (3)
    3. context_models       (3)
@@ -18,6 +18,7 @@ Verifies 100.0% mutation-kill efficacy (42/42 killed, 0 compile errors) across
   12. causal_mdl_surprise  (3)
   13. alpha_mdl_canon      (3)
   14. lean_expr_canon      (3)
+  15. inf2_hutter_stream   (3)
 """
 
 from __future__ import annotations
@@ -408,6 +409,29 @@ def build_info_mutants() -> list[InfoMutant]:
             "        (void)alpha_is_indexed_op(tok, len, \"BV\");\n"
             "        return true;\n"
             "    }",
+        ),
+        # --- 15. inf2_hutter_stream (3) ---
+        InfoMutant(
+            "M43_hws_icm_freeze_state",
+            "inf2_hutter_stream",
+            "    ws->icm_ctx[st->icm_idx] = hws_icm_next_state(st->icm_state, bit);",
+            "    ws->icm_ctx[st->icm_idx] = st->icm_state;\n    (void)hws_icm_next_state(st->icm_state, bit);",
+        ),
+        InfoMutant(
+            "M44_hws_match8_disable",
+            "inf2_hutter_stream",
+            "                    st->match_pos = cand8;\n"
+            "                    st->match_len = UINT32_C(8);",
+            "                    st->match_pos = cand8;\n"
+            "                    st->match_len = UINT32_C(0);",
+        ),
+        InfoMutant(
+            "M45_hws_mixer_b_zero",
+            "inf2_hutter_stream",
+            "            ws->mix_b[st->mix_ctx_b][k] =\n"
+            "                info_clamp_i32(ws->mix_b[st->mix_ctx_b][k] + dw, -8192, 16384);",
+            "            (void)dw;\n"
+            "            ws->mix_b[st->mix_ctx_b][k] = k_hws_init_w[k];",
         ),
     ]
 

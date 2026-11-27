@@ -276,6 +276,174 @@ void info_hunt_balke_pearl(uint64_t seed, info_hunt_bp_t *out);
 void info_hunt_causal_mdl(uint64_t seed, info_codec_ws_t *ws, uint8_t *bx, uint8_t *by,
                           info_hunt_causal_mdl_t *out);
 
+/* ============================================================================
+ * INF2 Streaming Continuous-State Hutter Context-Mixing Engine (Ring-0)
+ * ============================================================================ */
+
+#define INFO_INF2_MAGIC         UINT32_C(0x32464E49) /* "INF2" LE */
+#define INFO_INF2_HEADER_BYTES  UINT32_C(16)         /* magic[4], flags[4], orig_bytes[8] */
+#define INFO_INF2_BLOCK_HDR     UINT32_C(8)          /* raw_len[4], cmp_len[4] */
+#define INFO_INF2_TRAILER_BYTES UINT32_C(8)          /* fnv1a_64[8] */
+#define INFO_INF2_BLOCK_MAX     UINT32_C(1048576)    /* 1 MiB streaming block */
+
+#define INFO_HWS_ORD2_SIZE      (UINT32_C(1) << 20U)
+#define INFO_HWS_ORD3_SIZE      (UINT32_C(1) << 22U)
+#define INFO_HWS_ORD4_SIZE      (UINT32_C(1) << 22U)
+#define INFO_HWS_ORD5_SIZE      (UINT32_C(1) << 22U)
+#define INFO_HWS_ORD7_SIZE      (UINT32_C(1) << 22U)
+#define INFO_HWS_SPARSE_SIZE    (UINT32_C(1) << 21U)
+#define INFO_HWS_WORD_SIZE      (UINT32_C(1) << 22U)
+#define INFO_HWS_ICM_SIZE       (UINT32_C(1) << 22U)
+#define INFO_HWS_RING_SIZE      (UINT32_C(1) << 24U)
+#define INFO_HWS_MATCH_HT_SIZE  (UINT32_C(1) << 22U)
+#define INFO_HWS_MIX_CTX        UINT32_C(1024)
+#define INFO_HWS_NUM_EXPERTS    UINT32_C(14)
+#define INFO_HWS_APM_CTX        UINT32_C(256)
+#define INFO_HWS_APM_BINS       UINT32_C(33)
+
+typedef struct {
+    uint32_t ord0[256];
+    uint32_t ord1[65536];
+    uint32_t ord2[INFO_HWS_ORD2_SIZE];
+    uint32_t ord3[INFO_HWS_ORD3_SIZE];
+    uint32_t ord4[INFO_HWS_ORD4_SIZE];
+    uint32_t ord5[INFO_HWS_ORD5_SIZE];
+    uint32_t ord7[INFO_HWS_ORD7_SIZE];
+    uint32_t sparse13[INFO_HWS_SPARSE_SIZE];
+    uint32_t sparse24[INFO_HWS_SPARSE_SIZE];
+    uint32_t word1[INFO_HWS_WORD_SIZE];
+    uint32_t word2[INFO_HWS_WORD_SIZE];
+    uint8_t icm_ctx[INFO_HWS_ICM_SIZE];
+    uint16_t icm_map[256][16];
+    uint8_t ring[INFO_HWS_RING_SIZE];
+    uint32_t match_ht4[INFO_HWS_MATCH_HT_SIZE];
+    uint32_t match_ht8[INFO_HWS_MATCH_HT_SIZE];
+    int32_t mix_a[INFO_HWS_MIX_CTX][INFO_HWS_NUM_EXPERTS];
+    int32_t mix_b[INFO_HWS_MIX_CTX][INFO_HWS_NUM_EXPERTS];
+    uint16_t apm1[INFO_HWS_APM_CTX][INFO_HWS_APM_BINS];
+    uint16_t apm2[INFO_HWS_APM_CTX][INFO_HWS_APM_BINS];
+} info_hutter_ws_t;
+
+typedef struct {
+    uint8_t b1;
+    uint8_t b2;
+    uint8_t b3;
+    uint8_t b4;
+    uint8_t b5;
+    uint8_t b6;
+    uint8_t b7;
+    uint8_t b8;
+    uint32_t c0;
+    uint32_t bit_pos;
+    uint32_t word_h;
+    uint32_t prev_word_h;
+    uint32_t prev2_word_h;
+    uint64_t total_bytes;
+    uint64_t fnv64;
+
+    uint32_t match_pos;
+    uint32_t match_len;
+
+    uint64_t bit_hist64;
+    uint64_t bm_c;
+    uint64_t bm_b;
+    uint32_t bm_l;
+    uint32_t bm_m;
+    uint32_t bm_n;
+    uint32_t bm_streak;
+
+    uint8_t aff_a;
+    uint8_t aff_c;
+    uint8_t aff_pred_byte;
+    uint32_t aff_streak;
+    bool aff_valid;
+    uint16_t aff16_a;
+    uint16_t aff16_c;
+    uint16_t aff16_pred_word;
+    uint32_t aff16_streak;
+    bool aff16_valid;
+
+    uint8_t ca_rule_mask;
+    uint8_t ca_known_mask;
+    uint8_t ca_pred_byte;
+    uint8_t ca_known_byte;
+    uint32_t ca_streak;
+    uint8_t ca32_rule_mask;
+    uint8_t ca32_known_mask;
+    uint32_t ca32_pred_word;
+    uint32_t ca32_known_word;
+    uint32_t ca32_streak;
+
+    uint32_t h_ord2;
+    uint32_t h_ord3;
+    uint32_t h_ord4;
+    uint32_t h_ord5;
+    uint32_t h_ord7;
+    uint32_t h_sparse13;
+    uint32_t h_sparse24;
+    uint32_t h_word1;
+    uint32_t h_word2;
+
+    uint32_t idx_ord2;
+    uint32_t idx_ord3;
+    uint32_t idx_ord4;
+    uint32_t idx_ord5;
+    uint32_t idx_ord7;
+    uint32_t idx_sparse13;
+    uint32_t idx_sparse24;
+    uint32_t idx_word1;
+    uint32_t idx_word2;
+
+    uint16_t tag_ord2;
+    uint16_t tag_ord3;
+    uint16_t tag_ord4;
+    uint16_t tag_ord5;
+    uint16_t tag_ord7;
+    uint16_t tag_sparse13;
+    uint16_t tag_sparse24;
+    uint16_t tag_word1;
+    uint16_t tag_word2;
+
+    uint32_t icm_idx;
+    uint8_t icm_state;
+    uint32_t icm_grp;
+
+    int32_t logits[INFO_HWS_NUM_EXPERTS];
+    uint32_t mix_ctx_a;
+    uint32_t mix_ctx_b;
+    uint32_t p_mix;
+    uint32_t p_apm1;
+    uint32_t apm1_ctx;
+    uint32_t apm1_bin;
+    uint32_t apm1_rem;
+    uint32_t apm2_ctx;
+    uint32_t apm2_bin;
+    uint32_t apm2_rem;
+    uint32_t apm_on;
+    uint32_t last_alg_locked;
+    uint32_t flags;
+    uint64_t alg_hits;
+    uint64_t match_hits;
+} info_hutter_state_t;
+
+void info_hutter_ws_reset(info_hutter_ws_t *ws);
+void info_hutter_stream_begin(info_hutter_ws_t *ws, info_hutter_state_t *st, uint32_t flags);
+size_t info_hutter_encode_block(info_hutter_ws_t *ws, info_hutter_state_t *st, const uint8_t *src,
+                                size_t len, uint8_t *dst, size_t dst_cap);
+size_t info_hutter_decode_block(info_hutter_ws_t *ws, info_hutter_state_t *st, const uint8_t *src,
+                                size_t src_len, uint8_t *dst, size_t raw_len);
+uint64_t info_hutter_stream_fnv64(const info_hutter_state_t *st);
+void info_inf2_write_header(uint8_t dst[INFO_INF2_HEADER_BYTES], uint32_t flags,
+                            uint64_t orig_bytes);
+bool info_inf2_parse_header(const uint8_t src[INFO_INF2_HEADER_BYTES], uint32_t *out_flags,
+                            uint64_t *out_orig_bytes);
+void info_inf2_write_block_hdr(uint8_t dst[INFO_INF2_BLOCK_HDR], uint32_t raw_len,
+                               uint32_t cmp_len);
+void info_inf2_parse_block_hdr(const uint8_t src[INFO_INF2_BLOCK_HDR], uint32_t *out_raw_len,
+                               uint32_t *out_cmp_len);
+void info_put_u64_le_pub(uint8_t dst[8], uint64_t v);
+uint64_t info_get_u64_le_pub(const uint8_t src[8]);
+
 #ifdef __cplusplus
 }
 #endif

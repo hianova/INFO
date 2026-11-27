@@ -1,8 +1,8 @@
-# INFO v1.0.0
+# INFO v1.2.0
 
-**Certified Algorithmic Information Theory, Ring-0 Pure-GPR Hutter Context-Mixing & Law-Induction Codec, Causal MDL & Combinatorial Bounds**
+**Certified Algorithmic Information Theory, Ring-0 Pure-GPR Hutter Context-Mixing & Law-Induction Codec (`INF1` / Streaming `INF2`), Causal MDL & Combinatorial Bounds**
 
-`INFO v1.0.0` unifies algorithmic coding foundations, context-vs-induction separation, finite coding/channel bounds, causal identifiability, and Lean 4 kernel Proof-DAG MDL distillation on top of `../FLOW` (`v9.0.0`, `Flow.Schema` 256-slot `16,384B` ABI) across five formally verified Lean 4 pillars (`97` theorems total, `0 sorryAx`, `0 Lean.ofReduceBool`):
+`INFO v1.2.0` unifies algorithmic coding foundations, context-vs-induction separation, finite coding/channel bounds, causal identifiability, and Lean 4 kernel Proof-DAG MDL distillation on top of `../FLOW` (`v10.0.0`, `Flow.Schema` 256-slot `16,384B` ABI) across five formally verified Lean 4 pillars (`97` theorems total, `0 sorryAx`, `0 Lean.ofReduceBool`):
 
 1. **Algorithmic Coding, E1/E2/E3 Invariants & Structural α-MDL (`Info.Coding` — `28` theorems)**:
    - Pigeonhole incompressibility no-go, Kraft–McMillan prefix-tree inequality, Solomonoff/Bayes mixture dominance, Krichevsky–Trofimov (KT) exact rational conservation recurrence, 32-bit `E1/E2/E3` binary arithmetic renormalization & `bv_decide` bit-recovery proofs, plus De Bruijn α-canonicalization idempotency/renaming invariance (`deBruijnCanon_idempotent`, `deBruijnCanon_map_inj`) and Joint MDL refactoring breakeven (`mdl_no_free_abstraction`, `mdl_refactor_breakeven`, `mdl_asymmetric_hierarchy`).
@@ -17,22 +17,23 @@
 
 ## Empirical Validation ("Compression Is Intelligence")
 
-Unlike toy evaluators, `INFO` is audited by an `8`-gate build pipeline (`make verify-all`) and `7` end-to-end empirical test suites (`make experiments`) with a **standalone zero-heap decompressor (`build/info_decomp`, `34,072 B`)** verifying **100% SHA-256 bit-exact roundtrip** across every compressed payload:
+Unlike toy evaluators, `INFO` is audited by an `8`-gate build pipeline (`make verify-all`) and `7` end-to-end empirical test suites (`make experiments`) with a **standalone zero-heap decompressor (`build/info_decomp`, `51,400 B`)** supporting both single-block `INF1` and continuous multi-block streaming `INF2` with **100% SHA-256 bit-exact roundtrip** across every compressed payload:
 
-### 1. Compression Ladder & Hutter Self-Extracting Total Size (`64 KB` Benchmarks)
-Measured on real C17/Python/Markdown corpora, analytical depth-2 FSMX Markov source ($H^* = 5.001\text{ bpb}$), and non-cycling algorithmic generators (period $> 64\text{ KB}$):
+### 1. Compression Ladder & Hutter Self-Extracting Total Size (`64 KB` + Full `100 MB enwik8` Benchmarks)
+Measured on real C17/Python/Markdown corpora, analytical depth-2 FSMX Markov source ($H^* = 5.001\text{ bpb}$), non-cycling algorithmic generators (period $> 64\text{ KB}$), and the official **`enwik8` (`100,000,000 B`) Hutter Prize corpus** (with **zero** Wikipedia-specific dictionary hacks):
 
-| Corpus (`65,536 B`) | `deflate -9` | `zstd -19` | `bzip2 -9` | `lzma -9` | `INFO` (`bpb`) | `INFO` Hutter Total (`payload + info_decomp`) |
+| Corpus (`Size`) | `deflate -9` | `zstd -19` | `bzip2 -9` | `lzma -9` | `INFO` (`bpb`) | `INFO` Hutter Total (`payload + info_decomp`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `docs_real` (Markdown & prose) | `3.122` | `3.010` | `2.907` | `2.954` | **`2.705`** | `56,232 B` |
-| `code_real` (`INFO` C17 sources) | `1.792` | `1.659` | `1.622` | `1.549` | **`1.435`** | `45,830 B` |
-| `py_stdlib` (`argparse`/`difflib`/`inspect`/`json`) | `1.802` | `1.680` | `1.582` | `1.676` | **`1.498`** | `46,342 B` |
-| `fsmx_exact` ($H^* = 5.001\text{ bpb}$) | `5.777` | `5.421` | `5.955` | `5.559` | **`5.231`** | `76,924 B` |
-| `alg_lfsr23` (`LFSR-23` non-cycling) | `8.003` | `8.002` | `8.075` | `8.008` | **`0.006`** | **`34,121 B`** (`49 B` + `34,072 B`) |
-| `alg_ca32_rule30` (`CA32 Rule-30`) | `8.003` | `8.002` | `8.077` | `8.008` | **`0.019`** | **`34,227 B`** (`155 B` + `34,072 B`) |
-| `alg_affine16` (`Affine Mod-65536`) | `8.003` | `8.002` | `7.408` | `8.008` | **`0.017`** | **`34,211 B`** (`139 B` + `34,072 B`) |
+| `docs_real` (`65,536 B`) | `3.161` | `3.051` | `2.958` | `2.989` | **`2.747`** | `73,903 B` |
+| `code_real` (`65,536 B`) | `1.777` | `1.645` | `1.611` | `1.532` | **`1.415`** | `62,993 B` |
+| `py_stdlib` (`65,536 B`) | `1.802` | `1.680` | `1.582` | `1.676` | **`1.498`** | `63,670 B` |
+| `fsmx_exact` (`65,536 B`, $H^* = 5.001$) | `5.777` | `5.421` | `5.955` | `5.559` | **`5.231`** | `94,252 B` |
+| `alg_lfsr23` (`65,536 B`) | `8.003` | `8.002` | `8.075` | `8.008` | **`0.006`** | **`51,449 B`** (`49 B` + `51,400 B`) |
+| `alg_ca32_rule30` (`65,536 B`) | `8.003` | `8.002` | `8.077` | `8.008` | **`0.019`** | **`51,555 B`** (`155 B` + `51,400 B`) |
+| `alg_affine16` (`65,536 B`) | `8.003` | `8.002` | `7.408` | `8.008` | **`0.017`** | **`51,539 B`** (`139 B` + `51,400 B`) |
+| **`enwik8` (`100,000,000 B`, `INF2`)** | `2.918` | `2.156` | `2.321` | `1.989` | **`1.880`** | **`23,550,332 B`** (`23,498,932 B` + `51,400 B`, `1.8840 bpb`, SHA-256 OK) |
 
-*(Note: on `alg_affine16`, `bzip2 -9` captures trivial mod-$2^k$ low-bit cycles $2,4,8,16$ at `7.408 bpb`, still exceeding `INFO` payload by $> 435\times$ and `INFO` Hutter Total by $> 26\text{ KB}$.)*
+*(Note: on `enwik8`, pure Ring-0 Pure-GPR streaming `INF2` compresses `100,000,000 B` to `23,498,932 B` (`1.880 bpb`) and reconstructs bit-exact via `build/info_decomp` (`51,400 B`) for a Hutter Total of `23,550,332 B` (`1.8840 bpb`), beating `lzma -9` (`1.989 bpb`) by `> 1.31 MB` with `0` heap allocations and `0` corpus-specific rules; compress/decompress wall-clock `207.96s / 210.91s` (`0.46 / 0.45 MB/s`). On `alg_affine16`, `bzip2 -9` captures trivial mod-$2^k$ low-bit cycles $2,4,8,16$ at `7.408 bpb`, still exceeding `INFO` payload by $> 435\times$ and `INFO` Hutter Total by $> 9\text{ KB}$.)*
 
 ### 2. Downstream Intelligence, Switching Redundancy & Delsarte Atlas
 - **Zero-Shot 5-Domain Temporal Holdout Classification (`experiments/intelligence_downstream.py`)**: `INFO` conditional compression achieves **`5/5` (`100.0%`)** across `C17`, `Lean4`, `English`, `LFSR23` (`0.0020 bpb`), and `CA32` (`0.0244 bpb`), where `deflate -9` gains `1.06%` on both algorithmic domains and misclassifies `CA32`.
@@ -47,11 +48,11 @@ Measured on real C17/Python/Markdown corpora, analytical depth-2 FSMX Markov sou
 
 - [`Info/Coding.lean`](Info/Coding.lean), [`Info/Induction.lean`](Info/Induction.lean), [`Info/Bounds.lean`](Info/Bounds.lean), [`Info/Causal.lean`](Info/Causal.lean), [`Info/ProofMDL.lean`](Info/ProofMDL.lean), [`Info/Theory.lean`](Info/Theory.lean): Pure Lean 4 foundations (`28 + 18 + 17 + 16 + 18 = 97` theorems, `0 sorryAx`, `0 Lean.ofReduceBool`).
 - [`Info.lean`](Info.lean): Pure `Flow.Schema` `256`-slot (`16,384 B`) ABI compiler emitting zero-`memcpy` `build/info_schema_abi.h` (`0` local theorems/lemmas/axioms).
-- [`include/info.h`](include/info.h) & [`src/info_ring0.c`](src/info_ring0.c): Freestanding Ring-0 Pure-GPR C17 kernel (`0` undef symbols, `0` `udiv`/`sdiv`/FPU/SIMD/indirect calls, `C++20` header clean, `clang-tidy` `0` warnings). Implements 10-expert Hutter logistic mixer (`ord0`, `ord1`, tagged `ord2..ord6`/`sparse`/`word_tbl`, 1 MiB `match`, online GF(2) Berlekamp–Massey + mod-65536 4-step Hensel Affine + W=32 Rule-30 CA), SSE calibration, `"INF1"` framing, Ring-0 De Bruijn α-canonicalizer (`info_alpha_canonicalize`, including `INFO_LANG_LEAN_EXPR` for `expr`), Joint MDL evaluator (`info_eval_joint_mdl`), CTW/Delsarte/Balke–Pearl classifiers, and Causal MDL.
-- [`src/info_decomp_main.c`](src/info_decomp_main.c): Zero-heap standalone `"INF1"` decompressor (`build/info_decomp`, `34,072 B`).
-- [`src/info_cert.h`](src/info_cert.h) & [`src/info_cli.c`](src/info_cli.c): Zero-heap, zero-`leanshared` host CLI (`build/info`), `18`-suite `selftest` (`T1..T18`), and live `.lean` / `"FIR1"` certificate emitter.
-- [`oracles/verify_info_oracle.py`](oracles/verify_info_oracle.py): Gate 5 independent exact-rational oracle (`6/6` `info_decomp` SHA-256 checks + all `4` classifiers + `5/5` live `lean -DwarningAsError=true` & `leanchecker` cert replays + α-MDL invariance checks across `c`/`lean`/`py`/`expr`).
-- [`tools/info_sabotage_check.py`](tools/info_sabotage_check.py): Gate 6 parallel `42`-mutant single-fault C17 verification suite across `14` categories (`42/42 = 100.0%` killed), delegating to `../FLOW/sdk/tools/flow_sabotage_runner.py`.
+- [`include/info.h`](include/info.h) & [`src/info_ring0.c`](src/info_ring0.c): Freestanding Ring-0 Pure-GPR C17 kernel (`0` undef symbols, `0` `udiv`/`sdiv`/FPU/SIMD/indirect calls, `C++20` header clean, `clang-tidy` `0` warnings). Implements the 10-expert `"INF1"` logistic mixer (`ord0`..`ord6`, `sparse`, `word_tbl`, `1 MiB` match, GF(2) BM + Hensel Affine-16 + CA32, SSE), plus the **unlimited-size continuous streaming `"INF2"` Hutter engine** (`14` experts across `ord0..ord7`/`sparse13`/`sparse24`/`word1`/`word2`/Indirect Context Model `ICM` + `16 MiB` dual 8B/4B match + online law inducers, Dual-Context Logistic Mixer, 2-stage cascaded APM, `64-bit` FNV-1a streaming trailer), Ring-0 De Bruijn α-canonicalizer (`info_alpha_canonicalize`, including `INFO_LANG_LEAN_EXPR`), Joint MDL evaluator, and Causal/CTW/Delsarte classifiers.
+- [`src/info_decomp_main.c`](src/info_decomp_main.c): Zero-heap standalone `"INF1"` + streaming `"INF2"` decompressor (`build/info_decomp`, `51,400 B`).
+- [`src/info_cert.h`](src/info_cert.h) & [`src/info_cli.c`](src/info_cli.c): Zero-heap, zero-`leanshared` host CLI (`build/info`), `19`-suite `selftest` (`T1..T19`), automatic `> 4 MiB` / `--stream` `"INF2"` streaming, and live `.lean` / `"FIR1"` certificate emitter.
+- [`oracles/verify_info_oracle.py`](oracles/verify_info_oracle.py): Gate 5 independent exact-rational oracle (`7/7` `info_decomp` SHA-256 checks incl. `"INF2"` streaming + all `4` classifiers + `5/5` live `lean -DwarningAsError=true` & `leanchecker` cert replays + α-MDL invariance checks across `c`/`lean`/`py`/`expr`).
+- [`tools/info_sabotage_check.py`](tools/info_sabotage_check.py): Gate 6 parallel `45`-mutant single-fault C17 verification suite across `15` categories (`45/45 = 100.0%` killed), delegating to `../FLOW/sdk/tools/flow_sabotage_runner.py`.
 - [`tools/info_ecosystem_audit.py`](tools/info_ecosystem_audit.py), [`tools/lean_expr_export.lean`](tools/lean_expr_export.lean), [`tools/info_lean_distill.py`](tools/info_lean_distill.py), [`tools/info_proof_codec.py`](tools/info_proof_codec.py): Cross-repository structural MDL auditor, Lean 4 kernel Proof-DAG distiller, lossless chunked `.infp` v1/v2 Proof-DAG codec (`pack` / `unpack` / `bench`), and target-`.olean`-free kernel re-typechecker (`verify-dag`).
 
 ## Build, 8-Gate Verification & CLI
@@ -64,7 +65,7 @@ Standalone CLI & verification examples:
 
 ```sh
 ./build/info selftest
-./build/info compress   <in> <out.inf> [--no-alg]
+./build/info compress   <in> <out.inf> [--no-alg] [--stream]
 ./build/info decompress <in.inf> <out>
 ./build/info_decomp     <in.inf> <out>
 ./build/info eval-bpb   <in> [--no-alg] [--out-json build/eval.json]

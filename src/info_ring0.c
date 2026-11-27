@@ -2586,3 +2586,825 @@ void info_hunt_causal_mdl(uint64_t seed, info_codec_ws_t *ws, uint8_t *bx, uint8
     mh = info_fnv1a_u64(mh, out->lyx_total_q12);
     out->merkle = mh;
 }
+
+/* ============================================================================
+ * INF2 Streaming Continuous-State Hutter Context-Mixing Engine (Ring-0 Pure-GPR)
+ * ============================================================================ */
+
+static const uint16_t k_hws_icm_scale[31] = {
+    32768U, 16384U, 10923U, 8192U, 6554U, 5461U, 4681U, 4096U, 3641U, 3277U, 2979U,
+    2731U,  2521U,  2341U,  2185U, 2048U, 1928U, 1820U, 1725U, 1638U, 1560U, 1489U,
+    1425U,  1365U,  1311U,  1260U, 1214U, 1170U, 1130U, 1092U, 1057U};
+
+/* Initial weights across 14 experts:
+ * [0:ord0, 1:ord1, 2:ord2, 3:ord3, 4:ord4, 5:ord5, 6:ord7,
+ *  7:sparse13, 8:sparse24, 9:word1, 10:word2, 11:icm, 12:match, 13:alg] */
+static const int32_t k_hws_init_w[INFO_HWS_NUM_EXPERTS] = {192, 384, 640, 896, 1024, 1024, 896,
+                                                           512, 512, 896, 768, 896,  2048, 4096};
+
+void info_put_u64_le_pub(uint8_t dst[8], uint64_t v) {
+    if (dst == NULL) {
+        return;
+    }
+    for (uint32_t i = 0U; i < 8U; i++) {
+        dst[i] = (uint8_t)((v >> (i * 8U)) & UINT64_C(0xFF));
+    }
+}
+
+uint64_t info_get_u64_le_pub(const uint8_t src[8]) {
+    if (src == NULL) {
+        return UINT64_C(0);
+    }
+    uint64_t v = UINT64_C(0);
+    for (uint32_t i = 0U; i < 8U; i++) {
+        v |= ((uint64_t)src[i]) << (i * 8U);
+    }
+    return v;
+}
+
+void info_inf2_write_header(uint8_t dst[INFO_INF2_HEADER_BYTES], uint32_t flags,
+                            uint64_t orig_bytes) {
+    if (dst == NULL) {
+        return;
+    }
+    info_put_u32_le(dst, INFO_INF2_MAGIC);
+    info_put_u32_le(dst + 4, flags);
+    info_put_u64_le_pub(dst + 8, orig_bytes);
+}
+
+bool info_inf2_parse_header(const uint8_t src[INFO_INF2_HEADER_BYTES], uint32_t *out_flags,
+                            uint64_t *out_orig_bytes) {
+    if (src == NULL || out_flags == NULL || out_orig_bytes == NULL) {
+        return false;
+    }
+    if (info_get_u32_le(src) != INFO_INF2_MAGIC) {
+        return false;
+    }
+    *out_flags = info_get_u32_le(src + 4);
+    *out_orig_bytes = info_get_u64_le_pub(src + 8);
+    return true;
+}
+
+void info_inf2_write_block_hdr(uint8_t dst[INFO_INF2_BLOCK_HDR], uint32_t raw_len,
+                               uint32_t cmp_len) {
+    if (dst == NULL) {
+        return;
+    }
+    info_put_u32_le(dst, raw_len);
+    info_put_u32_le(dst + 4, cmp_len);
+}
+
+void info_inf2_parse_block_hdr(const uint8_t src[INFO_INF2_BLOCK_HDR], uint32_t *out_raw_len,
+                               uint32_t *out_cmp_len) {
+    if (src == NULL || out_raw_len == NULL || out_cmp_len == NULL) {
+        return;
+    }
+    *out_raw_len = info_get_u32_le(src);
+    *out_cmp_len = info_get_u32_le(src + 4);
+}
+
+void info_hutter_ws_reset(info_hutter_ws_t *ws) {
+    if (ws == NULL) {
+        return;
+    }
+    uint32_t init_slot = UINT32_C(2048) << 16U;
+    for (uint32_t i = 0U; i < 256U; i++) {
+        ws->ord0[i] = init_slot;
+    }
+    for (uint32_t i = 0U; i < 65536U; i++) {
+        ws->ord1[i] = init_slot;
+    }
+    info_zero_bytes(ws->ord2, sizeof(ws->ord2));
+    info_zero_bytes(ws->ord3, sizeof(ws->ord3));
+    info_zero_bytes(ws->ord4, sizeof(ws->ord4));
+    info_zero_bytes(ws->ord5, sizeof(ws->ord5));
+    info_zero_bytes(ws->ord7, sizeof(ws->ord7));
+    info_zero_bytes(ws->sparse13, sizeof(ws->sparse13));
+    info_zero_bytes(ws->sparse24, sizeof(ws->sparse24));
+    info_zero_bytes(ws->word1, sizeof(ws->word1));
+    info_zero_bytes(ws->word2, sizeof(ws->word2));
+    info_zero_bytes(ws->icm_ctx, sizeof(ws->icm_ctx));
+    info_zero_bytes(ws->ring, sizeof(ws->ring));
+    info_zero_bytes(ws->match_ht4, sizeof(ws->match_ht4));
+    info_zero_bytes(ws->match_ht8, sizeof(ws->match_ht8));
+
+    for (uint32_t n0 = 0U; n0 < 16U; n0++) {
+        for (uint32_t n1 = 0U; n1 < 16U; n1++) {
+            uint32_t s = (n0 << 4U) | n1;
+            uint32_t sum = n0 + n1;
+            uint32_t scale = (sum <= 30U) ? (uint32_t)k_hws_icm_scale[sum] : UINT32_C(1057);
+            uint32_t p = ((UINT32_C(2) * n1 + UINT32_C(1)) * scale) >> 4U;
+            if (p < 1U) {
+                p = 1U;
+            } else if (p > 4095U) {
+                p = 4095U;
+            }
+            for (uint32_t g = 0U; g < 16U; g++) {
+                ws->icm_map[s][g] = (uint16_t)p;
+            }
+        }
+    }
+
+    for (uint32_t c = 0U; c < INFO_HWS_MIX_CTX; c++) {
+        for (uint32_t e = 0U; e < INFO_HWS_NUM_EXPERTS; e++) {
+            ws->mix_a[c][e] = k_hws_init_w[e];
+            ws->mix_b[c][e] = k_hws_init_w[e];
+        }
+    }
+
+    for (uint32_t c = 0U; c < INFO_HWS_APM_CTX; c++) {
+        for (uint32_t b = 0U; b < INFO_HWS_APM_BINS; b++) {
+            uint32_t val = b * UINT32_C(128);
+            if (val < 1U) {
+                val = 1U;
+            }
+            if (val > 4095U) {
+                val = 4095U;
+            }
+            ws->apm1[c][b] = (uint16_t)val;
+            ws->apm2[c][b] = (uint16_t)val;
+        }
+    }
+}
+
+void info_hutter_stream_begin(info_hutter_ws_t *ws, info_hutter_state_t *st, uint32_t flags) {
+    if (ws == NULL || st == NULL) {
+        return;
+    }
+    info_hutter_ws_reset(ws);
+    info_zero_bytes(st, sizeof(*st));
+    st->c0 = UINT32_C(1);
+    st->bm_c = UINT64_C(1);
+    st->bm_b = UINT64_C(1);
+    st->bm_m = UINT32_C(1);
+    st->fnv64 = INFO_FNV1A_OFFSET;
+    st->flags = flags;
+}
+
+uint64_t info_hutter_stream_fnv64(const info_hutter_state_t *st) {
+    return (st == NULL) ? UINT64_C(0) : st->fnv64;
+}
+
+static uint32_t hws_untagged_update(uint32_t *slot, uint32_t bit) {
+    uint32_t v = *slot;
+    uint32_t p20 = v >> 8U;
+    uint32_t cnt = v & UINT32_C(0xFF);
+    uint32_t sh = UINT32_C(7);
+    if (cnt < 2U) {
+        sh = UINT32_C(1);
+    } else if (cnt < 6U) {
+        sh = UINT32_C(2);
+    } else if (cnt < 14U) {
+        sh = UINT32_C(3);
+    } else if (cnt < 30U) {
+        sh = UINT32_C(4);
+    } else if (cnt < 62U) {
+        sh = UINT32_C(5);
+    } else if (cnt < 126U) {
+        sh = UINT32_C(6);
+    }
+    uint32_t max_p20 = (UINT32_C(4096) << 8U) - UINT32_C(1);
+    uint32_t p_new =
+        (bit != 0U) ? (p20 + (((UINT32_C(1) << 20U) - p20) >> sh)) : (p20 - (p20 >> sh));
+    if (p_new < UINT32_C(256)) {
+        p_new = UINT32_C(256);
+    } else if (p_new > max_p20) {
+        p_new = max_p20;
+    }
+    if (cnt < UINT32_C(255)) {
+        cnt++;
+    }
+    *slot = (p_new << 8U) | cnt;
+    return p_new >> 8U;
+}
+
+static uint8_t hws_icm_next_state(uint8_t s, uint32_t bit) {
+    uint32_t n0 = ((uint32_t)s >> 4U) & UINT32_C(15);
+    uint32_t n1 = (uint32_t)s & UINT32_C(15);
+    if (bit != 0U) {
+        if (n1 < 15U) {
+            n1++;
+        }
+        if (n0 >= 2U) {
+            n0 = (n0 >> 1U) + UINT32_C(1);
+        }
+    } else {
+        if (n0 < 15U) {
+            n0++;
+        }
+        if (n1 >= 2U) {
+            n1 = (n1 >> 1U) + UINT32_C(1);
+        }
+    }
+    return (uint8_t)((n0 << 4U) | n1);
+}
+
+static uint32_t hws_hensel_inv16(uint32_t dx01_16) {
+    uint32_t inv = dx01_16;
+    for (uint32_t iter = 0U; iter < 4U; iter++) {
+        inv = (inv * (UINT32_C(2) - ((dx01_16 * inv) & UINT32_C(0xFFFF)))) & UINT32_C(0xFFFF);
+    }
+    return inv;
+}
+
+static void hws_fit_ca_row(bool is_w32, uint32_t prev_w, uint32_t cur_w, uint8_t *io_rule,
+                           uint8_t *io_known, uint32_t *io_streak) {
+    uint32_t width = is_w32 ? UINT32_C(32) : UINT32_C(8);
+    uint32_t top_bit = is_w32 ? UINT32_C(31) : UINT32_C(7);
+    bool conflict = false;
+    uint8_t rule_v = *io_rule;
+    uint8_t known_v = *io_known;
+    for (uint32_t b = 0U; b < width; b++) {
+        uint32_t r_bit = (b == 0U) ? top_bit : (b - UINT32_C(1));
+        uint32_t l_bit = (b == top_bit) ? UINT32_C(0) : (b + UINT32_C(1));
+        uint32_t nbh = (((prev_w >> l_bit) & 1U) << 2U) | (((prev_w >> b) & 1U) << 1U) |
+                       ((prev_w >> r_bit) & 1U);
+        uint32_t out_b = (cur_w >> b) & 1U;
+        uint32_t nbit = UINT32_C(1) << nbh;
+        if (((uint32_t)known_v & nbit) != 0U) {
+            if ((((uint32_t)rule_v >> nbh) & 1U) != out_b) {
+                conflict = true;
+                break;
+            }
+        } else {
+            known_v = (uint8_t)((uint32_t)known_v | nbit);
+            if (out_b != 0U) {
+                rule_v = (uint8_t)((uint32_t)rule_v | nbit);
+            }
+        }
+    }
+    if (conflict) {
+        rule_v = UINT8_C(0);
+        known_v = UINT8_C(0);
+        bool ok = true;
+        for (uint32_t b = 0U; b < width; b++) {
+            uint32_t r_bit = (b == 0U) ? top_bit : (b - UINT32_C(1));
+            uint32_t l_bit = (b == top_bit) ? UINT32_C(0) : (b + UINT32_C(1));
+            uint32_t nbh = (((prev_w >> l_bit) & 1U) << 2U) | (((prev_w >> b) & 1U) << 1U) |
+                           ((prev_w >> r_bit) & 1U);
+            uint32_t out_b = (cur_w >> b) & 1U;
+            uint32_t nbit = UINT32_C(1) << nbh;
+            if (((uint32_t)known_v & nbit) != 0U) {
+                if ((((uint32_t)rule_v >> nbh) & 1U) != out_b) {
+                    ok = false;
+                    break;
+                }
+            } else {
+                known_v = (uint8_t)((uint32_t)known_v | nbit);
+                if (out_b != 0U) {
+                    rule_v = (uint8_t)((uint32_t)rule_v | nbit);
+                }
+            }
+        }
+        *io_rule = ok ? rule_v : UINT8_C(0);
+        *io_known = ok ? known_v : UINT8_C(0);
+        *io_streak = ok ? UINT32_C(1) : UINT32_C(0);
+    } else {
+        *io_rule = rule_v;
+        *io_known = known_v;
+        (*io_streak)++;
+    }
+}
+
+static void hws_build_ca_pred(bool is_w32, uint32_t cur_w, uint8_t rule_v, uint8_t known_v,
+                              uint32_t *out_pred, uint32_t *out_known) {
+    uint32_t width = is_w32 ? UINT32_C(32) : UINT32_C(8);
+    uint32_t top_bit = is_w32 ? UINT32_C(31) : UINT32_C(7);
+    uint32_t pw = UINT32_C(0);
+    uint32_t kw = UINT32_C(0);
+    for (uint32_t b = 0U; b < width; b++) {
+        uint32_t r_bit = (b == 0U) ? top_bit : (b - UINT32_C(1));
+        uint32_t l_bit = (b == top_bit) ? UINT32_C(0) : (b + UINT32_C(1));
+        uint32_t nbh =
+            (((cur_w >> l_bit) & 1U) << 2U) | (((cur_w >> b) & 1U) << 1U) | ((cur_w >> r_bit) & 1U);
+        if ((((uint32_t)known_v >> nbh) & 1U) != 0U) {
+            kw |= (UINT32_C(1) << b);
+            if ((((uint32_t)rule_v >> nbh) & 1U) != 0U) {
+                pw |= (UINT32_C(1) << b);
+            }
+        }
+    }
+    *out_pred = pw;
+    *out_known = kw;
+}
+
+static void hws_on_byte_boundary(info_hutter_ws_t *ws, info_hutter_state_t *st, uint8_t completed) {
+    uint32_t ring_mask = INFO_HWS_RING_SIZE - UINT32_C(1);
+    uint64_t pos64 = st->total_bytes;
+    uint32_t pos = (uint32_t)(pos64 & UINT64_C(0xFFFFFFFF));
+    ws->ring[pos64 & (uint64_t)ring_mask] = completed;
+    pos64++;
+    st->total_bytes = pos64;
+    st->fnv64 ^= (uint64_t)completed;
+    st->fnv64 *= INFO_FNV1A_PRIME;
+
+    if (st->match_len > 0U) {
+        st->match_pos++;
+        if (st->match_len < UINT32_C(255)) {
+            st->match_len++;
+        }
+    }
+
+    if (pos64 >= UINT64_C(8)) {
+        uint8_t p1 = completed;
+        uint8_t p2 = st->b1;
+        uint8_t p3 = st->b2;
+        uint8_t p4 = st->b3;
+        uint32_t m_key4 =
+            ((uint32_t)p4 << 24U) | ((uint32_t)p3 << 16U) | ((uint32_t)p2 << 8U) | (uint32_t)p1;
+        uint32_t m_hi4 = ((uint32_t)st->b7 << 24U) | ((uint32_t)st->b6 << 16U) |
+                         ((uint32_t)st->b5 << 8U) | (uint32_t)st->b4;
+        uint32_t m_key8 = info_mix_hash32(m_hi4, m_key4);
+        uint32_t slot4 =
+            info_mix_hash32(m_key4, UINT32_C(0x517CC1B7)) & (INFO_HWS_MATCH_HT_SIZE - 1U);
+        uint32_t slot8 =
+            info_mix_hash32(m_key8, UINT32_C(0x9E3779B1)) & (INFO_HWS_MATCH_HT_SIZE - 1U);
+
+        if (st->match_len == 0U) {
+            uint32_t pos_cur = (uint32_t)pos64;
+            uint32_t cand8 = ws->match_ht8[slot8];
+            uint32_t delta8 = pos_cur - cand8;
+            if (cand8 >= 8U && delta8 > 0U && delta8 < (INFO_HWS_RING_SIZE - 16U)) {
+                if (ws->ring[(cand8 - 1U) & ring_mask] == p1 &&
+                    ws->ring[(cand8 - 2U) & ring_mask] == p2 &&
+                    ws->ring[(cand8 - 3U) & ring_mask] == p3 &&
+                    ws->ring[(cand8 - 4U) & ring_mask] == p4 &&
+                    ws->ring[(cand8 - 5U) & ring_mask] == st->b4 &&
+                    ws->ring[(cand8 - 6U) & ring_mask] == st->b5 &&
+                    ws->ring[(cand8 - 7U) & ring_mask] == st->b6 &&
+                    ws->ring[(cand8 - 8U) & ring_mask] == st->b7) {
+                    st->match_pos = cand8;
+                    st->match_len = UINT32_C(8);
+                }
+            }
+            if (st->match_len == 0U) {
+                uint32_t cand4 = ws->match_ht4[slot4];
+                uint32_t delta4 = pos_cur - cand4;
+                if (cand4 >= 4U && delta4 > 0U && delta4 < (INFO_HWS_RING_SIZE - 16U)) {
+                    if (ws->ring[(cand4 - 1U) & ring_mask] == p1 &&
+                        ws->ring[(cand4 - 2U) & ring_mask] == p2 &&
+                        ws->ring[(cand4 - 3U) & ring_mask] == p3 &&
+                        ws->ring[(cand4 - 4U) & ring_mask] == p4) {
+                        st->match_pos = cand4;
+                        st->match_len = UINT32_C(4);
+                    }
+                }
+            }
+        }
+        ws->match_ht8[slot8] = (uint32_t)pos64;
+        ws->match_ht4[slot4] = (uint32_t)pos64;
+    }
+
+    st->b8 = st->b7;
+    st->b7 = st->b6;
+    st->b6 = st->b5;
+    st->b5 = st->b4;
+    st->b4 = st->b3;
+    st->b3 = st->b2;
+    st->b2 = st->b1;
+    st->b1 = completed;
+
+    uint8_t lc = (completed >= (uint8_t)'A' && completed <= (uint8_t)'Z')
+                     ? (uint8_t)(completed | 32U)
+                     : completed;
+    if (info_is_word_char(lc)) {
+        st->word_h = info_mix_hash32(st->word_h, (uint32_t)lc);
+    } else if (st->word_h != 0U) {
+        st->prev2_word_h = st->prev_word_h;
+        st->prev_word_h = st->word_h;
+        st->word_h = UINT32_C(0);
+    }
+
+    st->h_ord2 = info_mix_hash32((uint32_t)st->b1, (uint32_t)st->b2);
+    st->h_ord3 = info_mix_hash32(st->h_ord2, (uint32_t)st->b3);
+    st->h_ord4 = info_mix_hash32(st->h_ord3, (uint32_t)st->b4);
+    st->h_ord5 = info_mix_hash32(st->h_ord4, (uint32_t)st->b5);
+    st->h_ord7 = info_mix_hash32(info_mix_hash32(st->h_ord5, (uint32_t)st->b6), (uint32_t)st->b7);
+    st->h_sparse13 = info_mix_hash32((uint32_t)st->b1, (uint32_t)st->b3);
+    st->h_sparse24 = info_mix_hash32(((uint32_t)st->b1 << 8U) | (uint32_t)st->b2, (uint32_t)st->b4);
+    st->h_word1 = info_mix_hash32(st->word_h, st->prev_word_h);
+    st->h_word2 = info_mix_hash32(st->h_word1, st->prev2_word_h);
+
+    if ((st->flags & INFO_CODEC_FLAG_ALG) != 0U && pos64 >= UINT64_C(3)) {
+        if (st->aff_valid && completed == st->aff_pred_byte) {
+            st->aff_streak++;
+        } else {
+            st->aff_streak = UINT32_C(0);
+        }
+        uint32_t dx01 = ((uint32_t)st->b2 - (uint32_t)st->b3) & UINT32_C(0xFF);
+        uint32_t dx12 = ((uint32_t)st->b1 - (uint32_t)st->b2) & UINT32_C(0xFF);
+        if (dx01 == dx12) {
+            st->aff_a = UINT8_C(1);
+            st->aff_c = (uint8_t)dx12;
+            st->aff_pred_byte = (uint8_t)(((uint32_t)st->b1 + dx12) & UINT32_C(0xFF));
+            if (st->aff_streak == 0U && ((uint32_t)st->b2 == (((uint32_t)st->b3 + dx12) & 0xFFU))) {
+                st->aff_streak = UINT32_C(1);
+            }
+            st->aff_valid = true;
+        } else if ((dx01 & 1U) != 0U) {
+            uint32_t inv = (uint32_t)k_inv_odd_mod256[dx01 >> 1U];
+            uint32_t a_cand = (dx12 * inv) & UINT32_C(0xFF);
+            uint32_t c_cand = ((uint32_t)st->b1 - a_cand * (uint32_t)st->b2) & UINT32_C(0xFF);
+            st->aff_a = (uint8_t)a_cand;
+            st->aff_c = (uint8_t)c_cand;
+            st->aff_pred_byte = (uint8_t)((a_cand * (uint32_t)st->b1 + c_cand) & UINT32_C(0xFF));
+            st->aff_valid = true;
+        } else {
+            st->aff_valid = false;
+            st->aff_streak = UINT32_C(0);
+        }
+
+        hws_fit_ca_row(false, (uint32_t)st->b2, (uint32_t)st->b1, &st->ca_rule_mask,
+                       &st->ca_known_mask, &st->ca_streak);
+        uint32_t pred8 = UINT32_C(0);
+        uint32_t know8 = UINT32_C(0);
+        hws_build_ca_pred(false, (uint32_t)st->b1, st->ca_rule_mask, st->ca_known_mask, &pred8,
+                          &know8);
+        st->ca_pred_byte = (uint8_t)pred8;
+        st->ca_known_byte = (uint8_t)know8;
+
+        if ((pos & UINT32_C(1)) == 0U && pos64 >= UINT64_C(6)) {
+            uint32_t w_cur = ((uint32_t)st->b2 << 8U) | (uint32_t)st->b1;
+            uint32_t w_prev = ((uint32_t)st->b4 << 8U) | (uint32_t)st->b3;
+            uint32_t w_prev2 = ((uint32_t)st->b6 << 8U) | (uint32_t)st->b5;
+            if (st->aff16_valid && w_cur == (uint32_t)st->aff16_pred_word) {
+                st->aff16_streak++;
+                st->aff16_pred_word =
+                    (uint16_t)(((uint32_t)st->aff16_a * w_cur + (uint32_t)st->aff16_c) &
+                               UINT32_C(0xFFFF));
+            } else {
+                st->aff16_streak = UINT32_C(0);
+                uint32_t dx01_16 = (w_prev - w_prev2) & UINT32_C(0xFFFF);
+                uint32_t dx12_16 = (w_cur - w_prev) & UINT32_C(0xFFFF);
+                if (dx01_16 == dx12_16) {
+                    st->aff16_a = UINT16_C(1);
+                    st->aff16_c = (uint16_t)dx12_16;
+                    st->aff16_pred_word = (uint16_t)((w_cur + dx12_16) & UINT32_C(0xFFFF));
+                    st->aff16_valid = true;
+                } else if ((dx01_16 & 1U) != 0U) {
+                    uint32_t inv = hws_hensel_inv16(dx01_16);
+                    uint32_t a16 = (dx12_16 * inv) & UINT32_C(0xFFFF);
+                    uint32_t c16 = (w_cur - ((a16 * w_prev) & UINT32_C(0xFFFF))) & UINT32_C(0xFFFF);
+                    st->aff16_a = (uint16_t)a16;
+                    st->aff16_c = (uint16_t)c16;
+                    st->aff16_pred_word = (uint16_t)(((a16 * w_cur + c16) & UINT32_C(0xFFFF)));
+                    st->aff16_valid = true;
+                } else {
+                    st->aff16_valid = false;
+                }
+            }
+        }
+
+        if ((pos & UINT32_C(3)) == 0U && pos64 >= UINT64_C(8)) {
+            uint64_t base_p = pos64 - UINT64_C(8);
+            uint32_t w_prev32 = ((uint32_t)ws->ring[(base_p + 0U) & (uint64_t)ring_mask] << 24U) |
+                                ((uint32_t)ws->ring[(base_p + 1U) & (uint64_t)ring_mask] << 16U) |
+                                ((uint32_t)ws->ring[(base_p + 2U) & (uint64_t)ring_mask] << 8U) |
+                                (uint32_t)ws->ring[(base_p + 3U) & (uint64_t)ring_mask];
+            uint32_t w_cur32 = ((uint32_t)st->b4 << 24U) | ((uint32_t)st->b3 << 16U) |
+                               ((uint32_t)st->b2 << 8U) | (uint32_t)st->b1;
+            hws_fit_ca_row(true, w_prev32, w_cur32, &st->ca32_rule_mask, &st->ca32_known_mask,
+                           &st->ca32_streak);
+            hws_build_ca_pred(true, w_cur32, st->ca32_rule_mask, st->ca32_known_mask,
+                              &st->ca32_pred_word, &st->ca32_known_word);
+        }
+    }
+
+    st->c0 = UINT32_C(1);
+    st->bit_pos = UINT32_C(0);
+}
+
+static uint32_t hws_pred_predict_bit(info_hutter_ws_t *ws, info_hutter_state_t *st) {
+    uint32_t c0 = st->c0;
+    uint32_t bp_down = UINT32_C(7) - st->bit_pos;
+    uint32_t c0m = c0 * UINT32_C(0x9E3779B1);
+
+    uint32_t p0 = ws->ord0[c0] >> 16U;
+    uint32_t p1 = ws->ord1[((uint32_t)st->b1 << 8U) | c0] >> 16U;
+    uint32_t p2 = tagged_lookup(ws->ord2, INFO_HWS_ORD2_SIZE - 1U, st->h_ord2 ^ c0m, &st->idx_ord2,
+                                &st->tag_ord2);
+    uint32_t p3 = tagged_lookup(ws->ord3, INFO_HWS_ORD3_SIZE - 1U, st->h_ord3 ^ c0m, &st->idx_ord3,
+                                &st->tag_ord3);
+    uint32_t p4 = tagged_lookup(ws->ord4, INFO_HWS_ORD4_SIZE - 1U, st->h_ord4 ^ c0m, &st->idx_ord4,
+                                &st->tag_ord4);
+    uint32_t p5 = tagged_lookup(ws->ord5, INFO_HWS_ORD5_SIZE - 1U, st->h_ord5 ^ c0m, &st->idx_ord5,
+                                &st->tag_ord5);
+    uint32_t p7 = tagged_lookup(ws->ord7, INFO_HWS_ORD7_SIZE - 1U, st->h_ord7 ^ c0m, &st->idx_ord7,
+                                &st->tag_ord7);
+    uint32_t ps13 = tagged_lookup(ws->sparse13, INFO_HWS_SPARSE_SIZE - 1U, st->h_sparse13 ^ c0m,
+                                  &st->idx_sparse13, &st->tag_sparse13);
+    uint32_t ps24 = tagged_lookup(ws->sparse24, INFO_HWS_SPARSE_SIZE - 1U, st->h_sparse24 ^ c0m,
+                                  &st->idx_sparse24, &st->tag_sparse24);
+    uint32_t pw1 = tagged_lookup(ws->word1, INFO_HWS_WORD_SIZE - 1U, st->h_word1 ^ c0m,
+                                 &st->idx_word1, &st->tag_word1);
+    uint32_t pw2 = tagged_lookup(ws->word2, INFO_HWS_WORD_SIZE - 1U, st->h_word2 ^ c0m,
+                                 &st->idx_word2, &st->tag_word2);
+
+    uint32_t icm_idx =
+        info_mix_hash32(st->h_ord3, ((uint32_t)st->b1 << 8U) | c0) & (INFO_HWS_ICM_SIZE - 1U);
+    uint8_t icm_state = ws->icm_ctx[icm_idx];
+    uint32_t icm_grp = (st->bit_pos << 1U) | ((st->b1 == st->b2) ? UINT32_C(1) : UINT32_C(0));
+    st->icm_idx = icm_idx;
+    st->icm_state = icm_state;
+    st->icm_grp = icm_grp;
+    uint32_t picm = (uint32_t)ws->icm_map[icm_state][icm_grp];
+
+    st->logits[0] = info_stretch(p0);
+    st->logits[1] = info_stretch(p1);
+    st->logits[2] = info_stretch(p2);
+    st->logits[3] = info_stretch(p3);
+    st->logits[4] = info_stretch(p4);
+    st->logits[5] = info_stretch(p5);
+    st->logits[6] = info_stretch(p7);
+    st->logits[7] = info_stretch(ps13);
+    st->logits[8] = info_stretch(ps24);
+    st->logits[9] = info_stretch(pw1);
+    st->logits[10] = info_stretch(pw2);
+    st->logits[11] = info_stretch(picm);
+
+    int32_t m_logit = 0;
+    if (st->match_len > 0U) {
+        uint8_t mb = ws->ring[(size_t)(st->match_pos & (INFO_HWS_RING_SIZE - 1U))];
+        uint32_t exp_b = ((uint32_t)mb >> bp_down) & UINT32_C(1);
+        int32_t mag = (st->match_len >= 24U) ? 2000 : (600 + (int32_t)st->match_len * 58);
+        m_logit = (exp_b != 0U) ? mag : -mag;
+        st->match_hits++;
+    }
+    st->logits[12] = m_logit;
+
+    int32_t alg_logit = 0;
+    uint32_t alg_locked = UINT32_C(0);
+    if ((st->flags & INFO_CODEC_FLAG_ALG) != 0U) {
+        if (st->bm_streak >= 12U && st->bm_l > 0U && st->bm_l <= 24U) {
+            uint32_t lp = info_parity64(st->bit_hist64 & (st->bm_c >> 1U));
+            alg_logit = (lp == 0U) ? -1950 : 1950;
+            alg_locked = 1U;
+        } else if (st->aff16_valid && st->aff16_streak >= 1U) {
+            uint32_t sh16 =
+                ((st->total_bytes & UINT64_C(1)) == UINT64_C(0)) ? UINT32_C(8) : UINT32_C(0);
+            uint8_t ab = (uint8_t)(((uint32_t)st->aff16_pred_word >> sh16) & UINT32_C(0xFF));
+            uint32_t a16_pred = ((uint32_t)ab >> bp_down) & UINT32_C(1);
+            alg_logit = (a16_pred != 0U) ? 1950 : -1950;
+            alg_locked = 1U;
+        } else if (st->ca32_streak >= 2U) {
+            uint32_t sh32 = (UINT32_C(3) - (uint32_t)(st->total_bytes & UINT64_C(3))) * UINT32_C(8);
+            uint32_t kb = (st->ca32_known_word >> sh32) & UINT32_C(0xFF);
+            if (((kb >> bp_down) & 1U) != 0U) {
+                uint32_t pb = (st->ca32_pred_word >> sh32) & UINT32_C(0xFF);
+                uint32_t c32_pred = (pb >> bp_down) & UINT32_C(1);
+                alg_logit = (c32_pred != 0U) ? 1950 : -1950;
+                alg_locked = 1U;
+            }
+        } else if (st->aff_valid && st->aff_streak >= 2U) {
+            uint32_t a_pred = ((uint32_t)st->aff_pred_byte >> bp_down) & UINT32_C(1);
+            alg_logit = (a_pred != 0U) ? 1950 : -1950;
+            alg_locked = 1U;
+        } else if (st->ca_streak >= 2U && (((uint32_t)st->ca_known_byte >> bp_down) & 1U) != 0U) {
+            uint32_t c_pred = ((uint32_t)st->ca_pred_byte >> bp_down) & UINT32_C(1);
+            alg_logit = (c_pred != 0U) ? 1950 : -1950;
+            alg_locked = 1U;
+        }
+    }
+    st->logits[13] = alg_logit;
+    st->last_alg_locked = alg_locked;
+    st->alg_hits += (uint64_t)alg_locked;
+
+    uint32_t bc1 = info_byte_class(st->b1);
+    uint32_t bc2 = info_byte_class(st->b2);
+    uint32_t m_bucket = UINT32_C(0);
+    if (st->match_len >= 16U) {
+        m_bucket = UINT32_C(3);
+    } else if (st->match_len >= 8U) {
+        m_bucket = UINT32_C(2);
+    } else if (st->match_len > 0U) {
+        m_bucket = UINT32_C(1);
+    }
+    st->mix_ctx_a =
+        ((m_bucket << 6U) | (bc1 << 3U) | st->bit_pos) & (INFO_HWS_MIX_CTX - UINT32_C(1));
+    st->mix_ctx_b = ((((uint32_t)st->b1 >> 4U) << 6U) | (bc2 << 3U) | st->bit_pos) &
+                    (INFO_HWS_MIX_CTX - UINT32_C(1));
+
+    int64_t dot_a = INT64_C(0);
+    int64_t dot_b = INT64_C(0);
+    for (uint32_t k = 0U; k < INFO_HWS_NUM_EXPERTS; k++) {
+        int64_t lk = (int64_t)st->logits[k];
+        dot_a += (int64_t)ws->mix_a[st->mix_ctx_a][k] * lk;
+        dot_b += (int64_t)ws->mix_b[st->mix_ctx_b][k] * lk;
+    }
+    int32_t la = (dot_a >= INT64_C(0)) ? (int32_t)(((uint64_t)dot_a) >> 11U)
+                                       : -(int32_t)(((uint64_t)(-dot_a)) >> 11U);
+    int32_t lb = (dot_b >= INT64_C(0)) ? (int32_t)(((uint64_t)dot_b) >> 11U)
+                                       : -(int32_t)(((uint64_t)(-dot_b)) >> 11U);
+    int32_t total_logit = info_sar_i32(la + lb, 1U);
+    uint32_t p_mix = info_squash(total_logit);
+    st->p_mix = p_mix;
+
+    if (alg_locked != 0U || st->match_len >= 16U) {
+        st->apm_on = UINT32_C(0);
+        return p_mix;
+    }
+
+    st->apm_on = UINT32_C(1);
+    st->apm1_ctx = (((uint32_t)st->b1 & UINT32_C(0xE0)) | (st->bit_pos << 2U) | (bc1 & 3U)) &
+                   (INFO_HWS_APM_CTX - UINT32_C(1));
+    uint32_t b1 = p_mix >> 7U;
+    uint32_t r1 = p_mix & UINT32_C(127);
+    if (b1 >= 32U) {
+        b1 = 31U;
+        r1 = 127U;
+    }
+    st->apm1_bin = b1;
+    st->apm1_rem = r1;
+    uint32_t a10 = (uint32_t)ws->apm1[st->apm1_ctx][b1];
+    uint32_t a11 = (uint32_t)ws->apm1[st->apm1_ctx][b1 + 1U];
+    uint32_t p_s1 = (a10 * (UINT32_C(128) - r1) + a11 * r1) >> 7U;
+    uint32_t p_stg1 = (p_mix + p_s1 * UINT32_C(3)) >> 2U;
+    if (p_stg1 < 1U) {
+        p_stg1 = 1U;
+    } else if (p_stg1 > 4095U) {
+        p_stg1 = 4095U;
+    }
+    st->p_apm1 = p_stg1;
+
+    uint32_t eq12 = (st->b1 == st->b2) ? UINT32_C(1) : UINT32_C(0);
+    st->apm2_ctx = ((((uint32_t)st->b1 >> 4U) << 4U) | (st->bit_pos << 1U) | eq12) &
+                   (INFO_HWS_APM_CTX - UINT32_C(1));
+    uint32_t b2 = p_stg1 >> 7U;
+    uint32_t r2 = p_stg1 & UINT32_C(127);
+    if (b2 >= 32U) {
+        b2 = 31U;
+        r2 = 127U;
+    }
+    st->apm2_bin = b2;
+    st->apm2_rem = r2;
+    uint32_t a20 = (uint32_t)ws->apm2[st->apm2_ctx][b2];
+    uint32_t a21 = (uint32_t)ws->apm2[st->apm2_ctx][b2 + 1U];
+    uint32_t p_s2 = (a20 * (UINT32_C(128) - r2) + a21 * r2) >> 7U;
+    uint32_t p_out = (p_stg1 + p_s2) >> 1U;
+    if (p_out < 1U) {
+        return UINT32_C(1);
+    }
+    if (p_out > 4095U) {
+        return UINT32_C(4095);
+    }
+    return p_out;
+}
+
+static void hws_pred_update_bit(info_hutter_ws_t *ws, info_hutter_state_t *st, uint32_t bit) {
+    uint32_t c0 = st->c0;
+    uint32_t bp_down = UINT32_C(7) - st->bit_pos;
+
+    (void)hws_untagged_update(&ws->ord0[c0], bit);
+    (void)hws_untagged_update(&ws->ord1[((uint32_t)st->b1 << 8U) | c0], bit);
+    tagged_update(ws->ord2, st->idx_ord2, st->tag_ord2, bit);
+    tagged_update(ws->ord3, st->idx_ord3, st->tag_ord3, bit);
+    tagged_update(ws->ord4, st->idx_ord4, st->tag_ord4, bit);
+    tagged_update(ws->ord5, st->idx_ord5, st->tag_ord5, bit);
+    tagged_update(ws->ord7, st->idx_ord7, st->tag_ord7, bit);
+    tagged_update(ws->sparse13, st->idx_sparse13, st->tag_sparse13, bit);
+    tagged_update(ws->sparse24, st->idx_sparse24, st->tag_sparse24, bit);
+    tagged_update(ws->word1, st->idx_word1, st->tag_word1, bit);
+    tagged_update(ws->word2, st->idx_word2, st->tag_word2, bit);
+
+    uint32_t mv = (uint32_t)ws->icm_map[st->icm_state][st->icm_grp];
+    int32_t m_tgt = (bit != 0U) ? 4096 : 0;
+    int32_t mv_new = (int32_t)mv + info_sar_i32(m_tgt - (int32_t)mv, 5U);
+    ws->icm_map[st->icm_state][st->icm_grp] = (uint16_t)info_clamp_i32(mv_new, 1, 4095);
+    ws->icm_ctx[st->icm_idx] = hws_icm_next_state(st->icm_state, bit);
+
+    if (st->match_len > 0U) {
+        uint8_t mb = ws->ring[(size_t)(st->match_pos & (INFO_HWS_RING_SIZE - 1U))];
+        uint32_t exp_b = ((uint32_t)mb >> bp_down) & UINT32_C(1);
+        if (bit != exp_b) {
+            st->match_len = 0U;
+        }
+    }
+
+    int32_t tgt = (bit != 0U) ? 4096 : 0;
+    int32_t err = tgt - (int32_t)st->p_mix;
+    for (uint32_t k = 0U; k < INFO_HWS_NUM_EXPERTS; k++) {
+        int32_t sk = st->logits[k];
+        if (sk != 0) {
+            int32_t dw = info_sar_i32(err * sk, 14U);
+            ws->mix_a[st->mix_ctx_a][k] =
+                info_clamp_i32(ws->mix_a[st->mix_ctx_a][k] + dw, -8192, 16384);
+            ws->mix_b[st->mix_ctx_b][k] =
+                info_clamp_i32(ws->mix_b[st->mix_ctx_b][k] + dw, -8192, 16384);
+        }
+    }
+
+    if (st->apm_on != 0U) {
+        uint32_t b1_idx = (st->apm1_rem >= 64U) ? (st->apm1_bin + 1U) : st->apm1_bin;
+        int32_t sv1 = (int32_t)ws->apm1[st->apm1_ctx][b1_idx];
+        ws->apm1[st->apm1_ctx][b1_idx] =
+            (uint16_t)info_clamp_i32(sv1 + info_sar_i32(tgt - sv1, 5U), 1, 4095);
+
+        uint32_t b2_idx = (st->apm2_rem >= 64U) ? (st->apm2_bin + 1U) : st->apm2_bin;
+        int32_t sv2 = (int32_t)ws->apm2[st->apm2_ctx][b2_idx];
+        ws->apm2[st->apm2_ctx][b2_idx] =
+            (uint16_t)info_clamp_i32(sv2 + info_sar_i32(tgt - sv2, 5U), 1, 4095);
+    }
+
+    if ((st->flags & INFO_CODEC_FLAG_ALG) != 0U) {
+        if (st->aff16_valid) {
+            uint32_t sh16 =
+                ((st->total_bytes & UINT64_C(1)) == UINT64_C(0)) ? UINT32_C(8) : UINT32_C(0);
+            uint32_t ab = ((uint32_t)st->aff16_pred_word >> sh16) & UINT32_C(0xFF);
+            if (bit != ((ab >> bp_down) & UINT32_C(1))) {
+                st->aff16_streak = UINT32_C(0);
+            }
+        }
+        if (st->ca32_streak > 0U) {
+            uint32_t sh32 = (UINT32_C(3) - (uint32_t)(st->total_bytes & UINT64_C(3))) * UINT32_C(8);
+            uint32_t kb = (st->ca32_known_word >> sh32) & UINT32_C(0xFF);
+            if (((kb >> bp_down) & 1U) != 0U) {
+                uint32_t pb = (st->ca32_pred_word >> sh32) & UINT32_C(0xFF);
+                if (bit != ((pb >> bp_down) & UINT32_C(1))) {
+                    st->ca32_streak = UINT32_C(0);
+                }
+            }
+        }
+        if (st->aff_valid && bit != (((uint32_t)st->aff_pred_byte >> bp_down) & UINT32_C(1))) {
+            st->aff_streak = UINT32_C(0);
+        }
+        if (st->ca_streak > 0U && (((uint32_t)st->ca_known_byte >> bp_down) & 1U) != 0U &&
+            bit != (((uint32_t)st->ca_pred_byte >> bp_down) & UINT32_C(1))) {
+            st->ca_streak = UINT32_C(0);
+        }
+        uint32_t bm_pred = info_parity64(st->bit_hist64 & (st->bm_c >> 1U));
+        if (bm_pred == bit) {
+            st->bm_streak++;
+            st->bm_m++;
+        } else {
+            st->bm_streak = UINT32_C(0);
+            uint64_t t_poly = st->bm_c;
+            if (st->bm_m < 40U) {
+                uint64_t xor_poly = st->bm_b << st->bm_m;
+                st->bm_c ^= xor_poly;
+            }
+            if (2U * st->bm_l <= st->bm_n) {
+                uint32_t new_l = st->bm_n + UINT32_C(1) - st->bm_l;
+                if (new_l > 24U) {
+                    st->bm_c = UINT64_C(1);
+                    st->bm_b = UINT64_C(1);
+                    st->bm_l = UINT32_C(0);
+                    st->bm_m = UINT32_C(1);
+                    st->bm_n = UINT32_C(0);
+                } else {
+                    st->bm_l = new_l;
+                    st->bm_b = t_poly;
+                    st->bm_m = UINT32_C(1);
+                    st->bm_n++;
+                }
+            } else {
+                st->bm_m++;
+                st->bm_n++;
+            }
+        }
+        st->bit_hist64 = (st->bit_hist64 << 1U) | (uint64_t)bit;
+    }
+
+    st->c0 = (c0 << 1U) | bit;
+    st->bit_pos++;
+    if (st->bit_pos == 8U) {
+        uint8_t completed = (uint8_t)(st->c0 & UINT32_C(0xFF));
+        hws_on_byte_boundary(ws, st, completed);
+    }
+}
+
+size_t info_hutter_encode_block(info_hutter_ws_t *ws, info_hutter_state_t *st, const uint8_t *src,
+                                size_t len, uint8_t *dst, size_t dst_cap) {
+    if (ws == NULL || st == NULL || dst == NULL || dst_cap == 0U || len == 0U || src == NULL) {
+        return 0U;
+    }
+    info_ac_enc_t enc;
+    ac_enc_init(&enc, dst, dst_cap);
+    for (size_t i = 0U; i < len; i++) {
+        uint8_t bv = src[i];
+        for (uint32_t bp = 8U; bp > 0U; bp--) {
+            uint32_t bit = ((uint32_t)bv >> (bp - 1U)) & UINT32_C(1);
+            uint32_t p = hws_pred_predict_bit(ws, st);
+            ac_enc_bit(&enc, p, bit);
+            hws_pred_update_bit(ws, st, bit);
+        }
+    }
+    return ac_enc_finish(&enc);
+}
+
+size_t info_hutter_decode_block(info_hutter_ws_t *ws, info_hutter_state_t *st, const uint8_t *src,
+                                size_t src_len, uint8_t *dst, size_t raw_len) {
+    if (ws == NULL || st == NULL || src == NULL || src_len == 0U || dst == NULL || raw_len == 0U) {
+        return SIZE_MAX;
+    }
+    info_ac_dec_t dec;
+    ac_dec_init(&dec, src, src_len);
+    for (size_t i = 0U; i < raw_len; i++) {
+        for (uint32_t bp = 0U; bp < 8U; bp++) {
+            uint32_t p = hws_pred_predict_bit(ws, st);
+            uint32_t bit = ac_dec_bit(&dec, p);
+            hws_pred_update_bit(ws, st, bit);
+        }
+        dst[i] = st->b1;
+    }
+    return raw_len;
+}

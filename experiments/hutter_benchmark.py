@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zlib
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -207,25 +208,105 @@ def compress_zstd19(raw_path: Path, zst_path: Path) -> int:
 
 def compress_info(
     raw_path: Path, inf_path: Path, extra_flags: Optional[List[str]] = None
-) -> Tuple[int, str]:
+) -> Tuple[int, str, float]:
     cmd = [str(INFO_BIN), "compress", str(raw_path), str(inf_path)]
     if extra_flags:
         cmd.extend(extra_flags)
+    t0 = time.perf_counter()
     res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    elapsed = time.perf_counter() - t0
     assert res.returncode == 0, f"info compress failed: {res.stderr}"
-    return inf_path.stat().st_size, res.stdout.strip()
+    return inf_path.stat().st_size, res.stdout.strip(), elapsed
 
 
-def decomp_verify_sha256(inf_path: Path, rec_path: Path, orig_sha256: str, label: str) -> None:
+def sha256_file(p: Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as fp:
+        while True:
+            blk = fp.read(1 << 20)
+            if not blk:
+                break
+            h.update(blk)
+    return h.hexdigest()
+
+
+def decomp_verify_sha256(inf_path: Path, rec_path: Path, orig_sha256: str, label: str) -> float:
+    t0 = time.perf_counter()
     res = subprocess.run(
         [str(DECOMP_BIN), str(inf_path), str(rec_path)],
         capture_output=True,
         text=True,
         check=False,
     )
+    elapsed = time.perf_counter() - t0
     assert res.returncode == 0, f"info_decomp failed on {label}: {res.stderr}"
-    got = hashlib.sha256(rec_path.read_bytes()).hexdigest()
+    got = sha256_file(rec_path)
     assert got == orig_sha256, f"SHA-256 mismatch on {label}: {got} != {orig_sha256}"
+    return elapsed
+
+
+def bench_file_path(
+    name: str, raw_p: Path, decomp_size: int, tdir: Path, force_stream: bool = False
+) -> Dict[str, float]:
+    n = raw_p.stat().st_size
+    sha = sha256_file(raw_p)
+
+    # Run external CLI compressors or Python stdlib
+    raw_bytes = raw_p.read_bytes() if n <= 16 * 1024 * 1024 else None
+    if raw_bytes is not None:
+        deflate_sz = len(zlib.compress(raw_bytes, level=9))
+        bzip2_sz = len(bz2.compress(raw_bytes, compresslevel=9))
+        lzma_sz = len(lzma.compress(raw_bytes, preset=9))
+    else:
+        comp_zlib = zlib.compressobj(level=9)
+        comp_bz2 = bz2.BZ2Compressor(9)
+        comp_lzma = lzma.LZMACompressor(preset=9)
+        deflate_sz = 0
+        bzip2_sz = 0
+        lzma_sz = 0
+        with raw_p.open("rb") as fp:
+            while True:
+                blk = fp.read(1 << 20)
+                if not blk:
+                    break
+                deflate_sz += len(comp_zlib.compress(blk))
+                bzip2_sz += len(comp_bz2.compress(blk))
+                lzma_sz += len(comp_lzma.compress(blk))
+        deflate_sz += len(comp_zlib.flush())
+        bzip2_sz += len(comp_bz2.flush())
+        lzma_sz += len(comp_lzma.flush())
+
+    zst_sz = compress_zstd19(raw_p, tdir / f"{name}.zst")
+
+    flags = ["--stream"] if (force_stream or n > CLI_MAX_BYTES) else []
+    info_inf = tdir / f"{name}.inf"
+    info_sz, _, cmp_sec = compress_info(raw_p, info_inf, flags)
+    dec_sec = decomp_verify_sha256(info_inf, tdir / f"{name}.rec", sha, name)
+
+    hutter_total = info_sz + decomp_size
+
+    def bpb(sz: int) -> float:
+        return (sz * 8.0) / float(n)
+
+    return {
+        "n": float(n),
+        "deflate_bpb": bpb(deflate_sz),
+        "zstd_bpb": bpb(zst_sz),
+        "bzip2_bpb": bpb(bzip2_sz),
+        "lzma_bpb": bpb(lzma_sz),
+        "noalg_bpb": bpb(info_sz),
+        "info_bpb": bpb(info_sz),
+        "hutter_bpb": bpb(hutter_total),
+        "deflate_sz": float(deflate_sz),
+        "zstd_sz": float(zst_sz),
+        "bzip2_sz": float(bzip2_sz),
+        "lzma_sz": float(lzma_sz),
+        "info_sz": float(info_sz),
+        "hutter_sz": float(hutter_total),
+        "cmp_sec": cmp_sec,
+        "dec_sec": dec_sec,
+        "h_star": -1.0,
+    }
 
 
 def bench_corpus(
@@ -242,12 +323,12 @@ def bench_corpus(
     lzma_sz = len(lzma.compress(data, preset=9))
 
     noalg_inf = tdir / f"{name}_noalg.inf"
-    noalg_sz, _ = compress_info(raw_p, noalg_inf, ["--no-alg"])
+    noalg_sz, _, _ = compress_info(raw_p, noalg_inf, ["--no-alg"])
     decomp_verify_sha256(noalg_inf, tdir / f"{name}_noalg.rec", sha, f"{name}(no-alg)")
 
     info_inf = tdir / f"{name}.inf"
-    info_sz, _ = compress_info(raw_p, info_inf)
-    decomp_verify_sha256(info_inf, tdir / f"{name}.rec", sha, name)
+    info_sz, _, cmp_sec = compress_info(raw_p, info_inf)
+    dec_sec = decomp_verify_sha256(info_inf, tdir / f"{name}.rec", sha, name)
 
     hutter_total = info_sz + decomp_size
 
@@ -269,14 +350,22 @@ def bench_corpus(
         "lzma_sz": float(lzma_sz),
         "info_sz": float(info_sz),
         "hutter_sz": float(hutter_total),
+        "cmp_sec": cmp_sec,
+        "dec_sec": dec_sec,
         "h_star": h_star_bpb if h_star_bpb is not None else -1.0,
     }
     return row
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="INFO v1.0.0 Hutter Compression Benchmark")
+    parser = argparse.ArgumentParser(description="INFO v1.2.0 Hutter Compression Benchmark")
     parser.add_argument("--enwik", type=Path, default=None, help="Optional path to enwik8/enwik9")
+    parser.add_argument(
+        "--enwik-limit",
+        type=int,
+        default=0,
+        help="Optional byte prefix limit for quick enwik tuning (0 = full file)",
+    )
     args = parser.parse_args()
 
     assert INFO_BIN.is_file(), f"Missing {INFO_BIN}"
@@ -294,18 +383,13 @@ def main() -> int:
         ("alg_affine16", py_gen_affine16(25173, 13849, 7, CORPUS_SIZE), None),
     ]
 
-    if args.enwik is not None:
-        assert args.enwik.is_file(), f"Missing --enwik file: {args.enwik}"
-        raw_enwik = args.enwik.read_bytes()[:CLI_MAX_BYTES]
-        corpora.append((f"enwik_{len(raw_enwik)}", raw_enwik, None))
-
     print(
-        f"[Experiment 1] INFO v1.0.0 Hutter Compression Benchmark "
+        f"[Experiment 1] INFO v1.2.0 Hutter Compression Benchmark "
         f"(standalone decomp={decomp_size} B, SHA-256 verified)"
     )
     header = (
-        f"  {'Corpus':<16} | {'Size':>7} | {'deflate-9':>9} | {'zstd-19':>8} | "
-        f"{'bzip2-9':>8} | {'lzma-9':>8} | {'INFO':>7} | {'HutterTot':>9} | {'Notes':<18}"
+        f"  {'Corpus':<16} | {'Size':>9} | {'deflate-9':>9} | {'zstd-19':>8} | "
+        f"{'bzip2-9':>8} | {'lzma-9':>8} | {'INFO':>7} | {'HutterTot':>10} | {'Notes':<22}"
     )
     print(header)
     print("  " + "-" * (len(header) - 2))
@@ -320,9 +404,35 @@ def main() -> int:
             if name.startswith("alg_"):
                 note = f"noalg={r['noalg_bpb']:.3f}"
             print(
-                f"  {name:<16} | {int(r['n']):>7} | {r['deflate_bpb']:>9.3f} | "
+                f"  {name:<16} | {int(r['n']):>9} | {r['deflate_bpb']:>9.3f} | "
                 f"{r['zstd_bpb']:>8.3f} | {r['bzip2_bpb']:>8.3f} | {r['lzma_bpb']:>8.3f} | "
-                f"{r['info_bpb']:>7.3f} | {int(r['hutter_sz']):>8}B | {note:<18}"
+                f"{r['info_bpb']:>7.3f} | {int(r['hutter_sz']):>9}B | {note:<22}"
+            )
+
+        if args.enwik is not None:
+            assert args.enwik.is_file(), f"Missing --enwik file: {args.enwik}"
+            if args.enwik_limit > 0:
+                slice_p = tdir / f"enwik_{args.enwik_limit}.bin"
+                with args.enwik.open("rb") as fi:
+                    slice_p.write_bytes(fi.read(args.enwik_limit))
+                ename = f"enwik_{args.enwik_limit}"
+                er = bench_file_path(ename, slice_p, decomp_size, tdir, force_stream=True)
+            else:
+                ename = args.enwik.name
+                er = bench_file_path(ename, args.enwik, decomp_size, tdir, force_stream=True)
+            results[ename] = er
+            mb_s = (er["n"] / (1024.0 * 1024.0)) / max(er["cmp_sec"], 1e-6)
+            dec_mb_s = (er["n"] / (1024.0 * 1024.0)) / max(er["dec_sec"], 1e-6)
+            enote = f"INF2 SHA256 {mb_s:.2f}/{dec_mb_s:.2f}MB/s"
+            print(
+                f"  {ename:<16} | {int(er['n']):>9} | {er['deflate_bpb']:>9.3f} | "
+                f"{er['zstd_bpb']:>8.3f} | {er['bzip2_bpb']:>8.3f} | {er['lzma_bpb']:>8.3f} | "
+                f"{er['info_bpb']:>7.3f} | {int(er['hutter_sz']):>9}B | {enote:<22}"
+            )
+            print(
+                f"  [enwik detail] payload={int(er['info_sz']):,} B + decomp={decomp_size:,} B = "
+                f"HutterTotal={int(er['hutter_sz']):,} B ({er['hutter_bpb']:.4f} bpb) | "
+                f"cmp={er['cmp_sec']:.2f}s dec={er['dec_sec']:.2f}s"
             )
 
     # Assertions matching Gate / Plan criteria
